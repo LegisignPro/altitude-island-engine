@@ -1,0 +1,23 @@
+[
+  {
+    "url": "https://example.a2zinc.net/api/exhibitors",
+    "status": 200,
+    "json": [
+      {"CompanyId": "1001", "CompanyName": "Acme Broadcast, Inc.", "Website": "https://acmebroadcast.com"},
+      {"CompanyId": "1002", "CompanyName": "Beta Media Systems", "Website": "betamedia.io"},
+      {"CompanyId": "1003", "CompanyName": "Nevada Pavilion", "Website": ""},
+      {"CompanyId": "1004", "CompanyName": "Gamma Robotics", "Website": "https://gammarobotics.com"}
+    ]
+  },
+  {
+    "url": "https://example.a2zinc.net/api/booths",
+    "status": 200,
+    "json": [
+      {"BoothNumber": "1200", "AreaSqFt": 400, "CompanyId": "1001", "Hall": "Hall A"},
+      {"BoothNumber": "1400", "AreaSqFt": 200, "CompanyId": "1001", "Hall": "Hall A"},
+      {"BoothNumber": "800", "Width": 20, "Length": 20, "CompanyId": "1002", "Hall": "Hall B"},
+      {"BoothNumber": "900", "AreaSqFt": 100, "CompanyId": "1003", "Hall": "Hall B"},
+      {"BoothNumber": "2200", "AreaSqFt": 900, "CompanyId": "1004", "Hall": "Hall A"}
+    ]
+  }
+]

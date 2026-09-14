@@ -49,15 +49,49 @@ assert metrics["Target Islands"] == str(expected), metrics
 at.sidebar.number_input[1].set_value(400)
 run(at)
 
-# 3. Prior-year CSV -> newborn island detection (simulate the upload through session state + engine)
+# 3. Task 2: multi-year timeline. First exercise the real "+ Add prior year" UI and confirm a
+# slot's widgets render; AppTest cannot simulate an actual file upload, so the data itself is
+# injected directly into session_state (same approach the old single-CSV test used).
+add_btn = [b for b in at.button if b.label.startswith("+ Add prior year")]
+assert add_btn, [b.label for b in at.button]
+add_btn[0].click()
+run(at)
+assert any(n.label == "Year" for n in at.number_input), "timeline slot Year input missing after Add"
+assert any(b.label == "Remove slot" for b in at.button), "timeline slot Remove button missing after Add"
+
 prior_csv = "exhibitor_name,sqft\nLumen Audio Labs,100\nOrbit Wireless Video,400\nKestrel Aerial Cinema,900\nSummit Streaming Platforms,100\n"
-at.session_state["prior_df"] = delta_engine.load_prior_csv(io.BytesIO(prior_csv.encode()))
-at.session_state["prior_name"] = "prior.csv"
+prior_df = delta_engine.load_prior_csv(io.BytesIO(prior_csv.encode())).rename(
+    columns={"prior_name": "exhibitor_name", "prior_sqft": "sqft"})[["exhibitor_name", "sqft"]]
+at.session_state["timeline_slots"] = [{"id": 901, "year": 2026, "df": prior_df, "label": "prior.csv", "error": ""}]
 run(at)
 metrics = {m.label: m.value for m in at.metric}
-print("delta metrics:", {k: v for k, v in metrics.items() if k in ("Newborn islands", "Upgrades", "Stagnant", "New to show")})
-assert metrics["Newborn islands"] == "2", metrics       # Lumen 100->400, Summit 100->600
-assert metrics["Stagnant"] == "2"                        # Orbit 400->400, Kestrel 900->900
+print("timeline metrics (2 slots):", {k: v for k, v in metrics.items()
+      if k in ("Newborn islands", "Peak retreats", "Steady growth", "Shrinking", "New to show")})
+assert metrics["Newborn islands"] == "2", metrics        # Lumen 100->400, Summit 100->600
+assert all(k in metrics for k in ("Peak retreats", "Steady growth", "Shrinking", "New to show"))
+
+# 3b. A THIRD slot turns a couple of those two-point deltas into a real multi-year shape:
+# Lumen grows steadily (100 -> 250 -> 400) and Vantage peaks then pulls back (300 -> 900 -> 600,
+# still >= 400 sq ft) -- Woz's "small -> large -> medium" pattern.
+prior_2024 = pd.DataFrame([{"exhibitor_name": "Lumen Audio Labs", "sqft": 100},
+                           {"exhibitor_name": "Vantage Robotics Systems", "sqft": 300}])
+prior_2025 = pd.DataFrame([{"exhibitor_name": "Lumen Audio Labs", "sqft": 250},
+                           {"exhibitor_name": "Vantage Robotics Systems", "sqft": 900}])
+at.session_state["timeline_slots"] = [
+    {"id": 902, "year": 2024, "df": prior_2024, "label": "2024.csv", "error": ""},
+    {"id": 903, "year": 2025, "df": prior_2025, "label": "2025.csv", "error": ""},
+]
+run(at)
+metrics = {m.label: m.value for m in at.metric}
+print("timeline metrics (3 slots):", {k: v for k, v in metrics.items()
+      if k in ("Newborn islands", "Peak retreats", "Steady growth", "Shrinking", "New to show")})
+assert metrics["Peak retreats"] == "1", metrics      # Vantage: 300 -> 900 -> 600 (50-90% of peak)
+assert metrics["Steady growth"] == "1", metrics      # Lumen: 100 -> 250 -> 400, monotonic, >= 400
+timeline_grid = [d for d in at.dataframe if "trajectory" in d.value.columns][0].value
+trajectories_seen = set(timeline_grid["trajectory"])
+print("timeline table trajectories:", trajectories_seen)
+assert "PEAK RETREAT" in trajectories_seen, trajectories_seen
+assert "STEADY GROWTH" in trajectories_seen, trajectories_seen
 
 # 4. Apollo mock enrichment (button in tab 4)
 btn = [b for b in at.button if b.label.startswith("Run Apollo enrichment")]
@@ -87,7 +121,32 @@ intro = [t for t in at.text_area if t.label == "Intro line"][0].value
 print("preview intro:", intro[:140])
 assert "DEMO DATA" in intro or "NAB Show" in intro
 
-# 7. Disable demo fallback + bad URL -> error state, no crash
+# 7. Task 1 regression: the "+1 year" fix. Overriding "Show year" in the sidebar must
+#    propagate everywhere the show label is used (banner pill, intro line) -- and it must
+#    come from EITHER this extraction's own inferred year OR what's typed here, never from
+#    today's date or a calendar.
+def show_year_box():
+    # AppTest rebuilds the element tree on every run(), so the widget handle must be
+    # re-fetched after each one rather than reused stale.
+    return [t for t in at.sidebar.text_input if t.label == "Show year"][0]
+
+
+show_year_box().set_value("2026")
+run(at)
+assert at.session_state["show_year"] == 2026, at.session_state["show_year"]
+assert any("2026" in m.value for m in at.markdown), "show-year override missing from banner pill"
+intro2 = [t for t in at.text_area if t.label == "Intro line"][0].value
+print("preview intro after year override:", intro2[:140])
+assert "2026" in intro2, intro2
+# Clearing the override falls back to the year THIS extraction observed (2027 for the
+# demo dataset) -- session_state itself holds None (never silently re-guessed), and only
+# the composed label falls back.
+show_year_box().set_value("")
+run(at)
+assert at.session_state["show_year"] is None, at.session_state["show_year"]
+assert any("2027" in m.value for m in at.markdown), "fallback to extracted show year missing"
+
+# 8. Disable demo fallback + bad URL -> error state, no crash
 at.sidebar.checkbox[1].set_value(False)
 at.sidebar.text_input[1].set_value("https://notreal.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm")
 at.sidebar.button[0].click()

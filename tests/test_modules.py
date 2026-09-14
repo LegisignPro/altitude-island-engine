@@ -62,7 +62,29 @@ def test_fallback():
     rows, meta = scraper.load_fallback_dataset()
     assert len(rows) == 20 and meta["source"] == "demo"
     assert all(set(scraper.EXHIBITOR_COLUMNS) <= set(r) for r in rows)
+    assert meta["show_base"] == "NAB Show" and meta["show_year"] == 2027
     print("fallback OK")
+
+
+def test_show_year():
+    """infer_show_base / infer_show_year: the split that fixes the '+1 year' bug (Task 1)."""
+    cases = [
+        ("https://nab27.mapyourshow.com/8_0/x", "NAB Show", 2027),
+        ("https://ces2026.mapyourshow.com/8_0/x", "CES", 2026),
+        ("https://woc26.mapyourshow.com/x", "World of Concrete", 2026),
+        ("https://packexpo.mapyourshow.com/x", "PACK EXPO", None),
+        ("https://imts-2026.mapyourshow.com/x", "IMTS", 2026),
+        ("https://nab.mapyourshow.com/x", "NAB Show", None),  # no digits at all -> no year, never guessed
+    ]
+    for url, exp_base, exp_year in cases:
+        got_base, got_year = scraper.infer_show_base(url), scraper.infer_show_year(url)
+        assert got_base == exp_base, (url, got_base, exp_base)
+        assert got_year == exp_year, (url, got_year, exp_year)
+    # infer_show_name stays a thin wrapper: base+year when a year is present, base alone otherwise.
+    assert scraper.infer_show_name("https://nab27.mapyourshow.com/") == "NAB Show 2027"
+    assert scraper.infer_show_name("https://ces2026.mapyourshow.com/8_0/x") == "CES 2026"
+    assert scraper.infer_show_name("https://nab.mapyourshow.com/x") == "NAB Show"
+    print("show year/base OK")
 
 
 def test_delta(current: pd.DataFrame):
@@ -84,6 +106,89 @@ def test_delta(current: pd.DataFrame):
     assert (none["yoy_status"] == delta_engine.STATUS_NONE).all()
     print("delta OK")
     return out
+
+
+def test_classify_trajectory():
+    """classify_trajectory on hand-built (year, sqft) series (Task 2)."""
+    ct = delta_engine.classify_trajectory
+    # Woz's two worked examples.
+    assert ct([(2024, 100), (2025, 900), (2026, 600)], 3) == delta_engine.TRAJ_PEAK_RETREAT
+    assert ct([(2024, 100), (2025, 400), (2026, 600)], 3) == delta_engine.TRAJ_STEADY_GROWTH
+    # Only one slot loaded at all -> nothing to compare against, for anyone.
+    assert ct([(2026, 600)], 1) == delta_engine.TRAJ_NONE
+    # 3 slots loaded, but this company only appears in the current one.
+    assert ct([(2026, 600)], 3) == delta_engine.TRAJ_NEW
+    # Exactly 2 points reduce to the original single-step semantics.
+    assert ct([(2025, 100), (2026, 600)], 3) == delta_engine.TRAJ_NEWBORN
+    assert ct([(2025, 600), (2026, 900)], 3) == delta_engine.TRAJ_UPGRADE
+    assert ct([(2025, 900), (2026, 600)], 3) == delta_engine.TRAJ_DOWNSIZE
+    assert ct([(2025, 600), (2026, 600)], 3) == delta_engine.TRAJ_STAGNANT
+    # 3+ points, monotonic increase -> steady growth (even with an early inline year).
+    assert ct([(2024, 600), (2025, 900), (2026, 1200)], 3) == delta_engine.TRAJ_STEADY_GROWTH
+    # 3+ points, monotonic DECREASE from the very first year on file: that's a plain decline,
+    # not a "retreat" -- there was no growth into the peak (peak IS the first point), even
+    # though the final value happens to land in the 50-90% band.
+    assert ct([(2024, 1200), (2025, 900), (2026, 600)], 3) == delta_engine.TRAJ_SHRINKING
+    # 3+ points, up-down-up -> more than one direction change -> volatile.
+    assert ct([(2023, 400), (2024, 900), (2025, 400), (2026, 900)], 4) == delta_engine.TRAJ_VOLATILE
+    # A late-arriving newborn still wins outright even with 3+ points of history.
+    assert ct([(2024, 100), (2025, 150), (2026, 400)], 3) == delta_engine.TRAJ_NEWBORN
+    # Peak retreat that would ALSO look like a straight decline by percentage alone is still
+    # correctly told apart from SHRINKING purely by "did it grow first" (peak not the 1st pt).
+    assert ct([(2023, 300), (2024, 1000), (2025, 700), (2026, 550)], 4) == delta_engine.TRAJ_PEAK_RETREAT
+    print("classify_trajectory OK")
+
+
+def test_build_trajectories():
+    """build_trajectories() over several synthetic year slots (Task 2)."""
+    slots = [
+        {"year": 2024, "label": "2024", "source": "csv",
+         "df": pd.DataFrame([{"exhibitor_name": "Acme Broadcast Inc", "sqft": 100},
+                             {"exhibitor_name": "Vantage Robotics Systems Inc", "sqft": 500},
+                             {"exhibitor_name": "Stagnant Co", "sqft": 600}])},
+        {"year": 2025, "label": "2025", "source": "csv",
+         "df": pd.DataFrame([{"exhibitor_name": "Acme Broadcast, Inc.", "sqft": 400},
+                             {"exhibitor_name": "Vantage Robotics Systems", "sqft": 900},
+                             {"exhibitor_name": "Stagnant Co", "sqft": 600},
+                             {"exhibitor_name": "Left After 2025", "sqft": 500}])},
+        {"year": 2026, "label": "2026 (live)", "source": "live",
+         "df": pd.DataFrame([{"exhibitor_name": "Acme Broadcast, Inc.", "sqft": 600},
+                             {"exhibitor_name": "Vantage Robotics Systems", "sqft": 600},
+                             {"exhibitor_name": "Stagnant Co", "sqft": 600},
+                             {"exhibitor_name": "Brand New Exhibitor", "sqft": 450}])},
+    ]
+    traj = delta_engine.build_trajectories(slots)
+    assert {"sqft_2024", "sqft_2025", "sqft_2026", "trajectory", "yoy_status", "is_current_year"} <= set(traj.columns)
+    by_key = {r["name_key"]: r for _, r in traj.iterrows()}
+
+    acme = by_key[delta_engine.name_key("Acme Broadcast Inc")]
+    assert acme["exhibitor_name"] == "Acme Broadcast, Inc."   # latest spelling wins
+    assert acme["sqft_2024"] == 100 and acme["sqft_2025"] == 400 and acme["sqft_2026"] == 600
+    assert acme["trajectory"] == delta_engine.TRAJ_STEADY_GROWTH
+    assert acme["is_current_year"] is True
+
+    vantage = by_key[delta_engine.name_key("Vantage Robotics Systems")]
+    assert vantage["sqft_2024"] == 500 and vantage["sqft_2025"] == 900 and vantage["sqft_2026"] == 600
+    assert vantage["trajectory"] == delta_engine.TRAJ_PEAK_RETREAT
+    assert vantage["peak_sqft"] == 900 and vantage["peak_year"] == 2025
+
+    stagnant = by_key[delta_engine.name_key("Stagnant Co")]
+    assert stagnant["trajectory"] == delta_engine.STATUS_STAGNANT
+    assert stagnant["yoy_status"] == delta_engine.STATUS_STAGNANT
+
+    left = by_key[delta_engine.name_key("Left After 2025")]
+    assert left["is_current_year"] is False and pd.isna(left["sqft_2026"])
+    assert left["yoy_status"] == delta_engine.STATUS_NONE   # not exhibiting this year -- no signal to trigger on
+    assert left["newborn_island"] is False
+
+    brand_new = by_key[delta_engine.name_key("Brand New Exhibitor")]
+    assert brand_new["trajectory"] == delta_engine.TRAJ_NEW and brand_new["yoy_status"] == delta_engine.STATUS_NEW
+
+    summary = delta_engine.trajectory_summary(traj)
+    assert summary["steady_growth"] == 1 and summary["peak_retreat"] == 1 and summary["stagnant"] == 1
+    assert summary["new"] == 1
+    print("build_trajectories OK")
+    return traj
 
 
 def test_freight():
@@ -140,7 +245,10 @@ if __name__ == "__main__":
     try:
         current = test_scraper()
         test_fallback()
+        test_show_year()
         delta_df = test_delta(current)
+        test_classify_trajectory()
+        test_build_trajectories()
         test_freight()
         test_apollo_mock_and_pitch(delta_df)
         print("\nALL MODULE TESTS PASSED")

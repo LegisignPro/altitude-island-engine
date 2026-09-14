@@ -1,0 +1,17 @@
+[
+  {
+    "url": "https://example.expocadweb.com/api/booths",
+    "status": 200,
+    "json": [
+      {"BoothID": "B1", "BoothNumber": "301", "Area": "400 sq ft", "CompanyName": "Delta Cameras",
+       "Website": "https://deltacameras.com", "Hall": "Hall 1"},
+      {"BoothID": "B2", "BoothNumber": "302", "Width": 20, "Length": 20, "CompanyName": "Epsilon Displays",
+       "Website": "epsilondisplays.com", "Hall": "Hall 1"},
+      {"BoothID": "B3", "BoothNumber": "303",
+       "Points": [{"x": 0, "y": 0}, {"x": 30, "y": 0}, {"x": 30, "y": 30}, {"x": 0, "y": 30}],
+       "CompanyName": "Zeta Robotics", "Website": "", "Hall": "Hall 2"},
+      {"BoothID": "B4", "BoothNumber": "304", "Area": "0", "CompanyName": "State of Ohio",
+       "Website": "", "Hall": "Hall 2"}
+    ]
+  }
+]
