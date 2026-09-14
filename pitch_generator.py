@@ -6,6 +6,9 @@ Trigger hierarchy (first match wins):
 
     A  NEWBORN ISLAND   prior year < 200 sq ft, this year >= 400 sq ft (delta engine)
                         Pitch: height limits, rigging panic, drayage optimisation.
+    E  PEAK RETREAT     3+ years on file: grew to a peak, then pulled back to 50-90% of
+                        it and is still a 400+ sq ft island (timeline engine)
+                        Pitch: second act -- fresh partner for the comeback build.
     B  NEW HIRE         Apollo contact with < 6 months in the current role
                         Pitch: refresh the incumbent agency's stale design; make their mark.
     C  FREIGHT / LOCAL  HQ outside the West (East Coast, Midwest, South, international)
@@ -17,16 +20,19 @@ Trigger hierarchy (first match wins):
 
 Every merge field in the intro line is an observed fact: the exhibitor name
 and booth footprint from MapYourShow, the prior footprint from the uploaded
-CSV, the contact's name and title from Apollo, the HQ state from Apollo.
+CSV or timeline slots, the contact's name and title from Apollo, the HQ
+state from Apollo.
 """
 
 from __future__ import annotations
 
 import pandas as pd
 
+import delta_engine
 import freight
 
 TRIGGER_A = "A"
+TRIGGER_E = "E"
 TRIGGER_B = "B"
 TRIGGER_C = "C"
 TRIGGER_D = "D"
@@ -39,29 +45,37 @@ TRIGGERS = {
         "priority": 1,
         "pitch_angle": "First-island survival: height limits, rigging panic, drayage optimisation",
     },
+    TRIGGER_E: {
+        "badge": "PEAK RETREAT",
+        "color": "orange",
+        "hex": "#f97316",
+        "priority": 2,
+        "pitch_angle": "Second act: they went big once, pulled back -- a fresh partner and a "
+                       "fixed-price island for the comeback build",
+    },
     TRIGGER_B: {
         "badge": "NEW HIRE",
         "color": "violet",
         "hex": "#8b5cf6",
-        "priority": 2,
+        "priority": 3,
         "pitch_angle": "New decision-maker: refresh the incumbent agency's stale booth and make your mark",
     },
     TRIGGER_C: {
         "badge": "FREIGHT ARBITRAGE",
         "color": "blue",
         "hex": "#3b82f6",
-        "priority": 3,
+        "priority": 4,
         "pitch_angle": "Home-field: local Vegas storage and zero-freight asset takeover",
     },
     TRIGGER_D: {
         "badge": "AOR FRICTION",
-        "color": "orange",
+        "color": "amber",
         "hex": "#f59e0b",
-        "priority": 4,
+        "priority": 5,
         "pitch_angle": "Billing shock: fixed-price guarantee, no post-show change orders, no agency drayage markup",
     },
 }
-HIGH_PRIORITY = {TRIGGER_A, TRIGGER_B, TRIGGER_C}
+HIGH_PRIORITY = {TRIGGER_A, TRIGGER_E, TRIGGER_B, TRIGGER_C}
 
 PRICE_PER_SQFT = 150   # pipeline estimate only: total target sq ft x $150
 
@@ -83,6 +97,8 @@ def _first_name(row: pd.Series) -> str:
 def choose_trigger(row: pd.Series) -> str:
     if bool(row.get("newborn_island")):
         return TRIGGER_A
+    if str(row.get("trajectory") or "") == delta_engine.TRAJ_PEAK_RETREAT:
+        return TRIGGER_E
     if bool(row.get("new_hire")):
         return TRIGGER_B
     tag = str(row.get("freight_tag") or "")
@@ -106,6 +122,15 @@ def intro_line(row: pd.Series, trigger: str, show_name: str) -> str:
         return (f"{greet}saw {company} moved up {prior_txt}to a {dims} island at {show_name}{booth_txt}. "
                 f"First island on the floor usually means first run-in with hall height limits, rigging quotes "
                 f"and drayage per crate. We build islands in Las Vegas that are engineered around all three.")
+    if trigger == TRIGGER_E:
+        peak, peak_year = row.get("peak_sqft"), row.get("peak_year")
+        if peak is not None and not pd.isna(peak) and peak_year is not None and not pd.isna(peak_year):
+            move_txt = f"moved from {int(peak):,} sq ft in {int(peak_year)} to {int(sqft):,} sq ft this year"
+        else:
+            move_txt = f"is back down to a {dims} island this year"
+        return (f"{greet}noticed {company} {move_txt} at {show_name}{booth_txt}. A booth that grows, peaks and "
+                f"comes back down usually means a partner search is already underway -- we build fixed-price "
+                f"islands engineered for a strong second act, so the next jump up has no surprises in it.")
     if trigger == TRIGGER_B:
         title = str(row.get("contact_title") or "your new role")
         return (f"{greet}congratulations on the move into {title} at {company}. Your {dims} at {show_name}"
@@ -151,7 +176,8 @@ def assign_pitches(df: pd.DataFrame, show_name: str) -> pd.DataFrame:
 
 EXPORT_COLUMNS = ["email", "first_name", "last_name", "contact_title", "company_name", "website", "booth_number",
                   "booth_sqft", "trigger_badge", "pitch_angle", "custom_intro_line", "show_name",
-                  "hq_state", "freight_tag", "yoy_status", "linkedin", "data_source"]
+                  "hq_state", "freight_tag", "yoy_status", "trajectory", "peak_sqft", "peak_year",
+                  "linkedin", "data_source"]
 
 
 def build_export(df: pd.DataFrame, show_name: str) -> pd.DataFrame:
@@ -174,6 +200,9 @@ def build_export(df: pd.DataFrame, show_name: str) -> pd.DataFrame:
         "hq_state": df.get("hq_state", pd.Series([""] * len(df))).fillna(""),
         "freight_tag": df.get("freight_tag", pd.Series([""] * len(df))).fillna(""),
         "yoy_status": df.get("yoy_status", pd.Series([""] * len(df))).fillna(""),
+        "trajectory": df.get("trajectory", pd.Series([""] * len(df))).fillna(""),
+        "peak_sqft": pd.to_numeric(df.get("peak_sqft", pd.Series([None] * len(df))), errors="coerce"),
+        "peak_year": pd.to_numeric(df.get("peak_year", pd.Series([None] * len(df))), errors="coerce"),
         "linkedin": df.get("linkedin", pd.Series([""] * len(df))).fillna(""),
         "data_source": df.get("apollo_source", pd.Series([""] * len(df))).fillna(""),
     })
