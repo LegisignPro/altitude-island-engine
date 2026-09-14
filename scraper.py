@@ -90,18 +90,34 @@ def mys_base(url: str) -> tuple[str, str]:
     return f"{p.scheme or 'https'}://{p.netloc}", (m.group(1) if m else "8_0")
 
 
-def infer_show_name(url: str) -> str:
-    """ces2026.mapyourshow.com -> 'CES 2026'; nab27 -> 'NAB Show 2027'."""
+_HOST_LABEL_RE = re.compile(r"^([a-z]+?)[-_]?(\d{2}|\d{4})?$")
+
+
+def infer_show_base(url: str) -> str:
+    """ces2026.mapyourshow.com -> 'CES'; nab27 -> 'NAB Show'; unrecognised host -> 'Trade Show'."""
     label = urlparse(url).netloc.lower().split(".")[0] if urlparse(url).netloc else ""
-    m = re.match(r"^([a-z]+?)[-_]?(\d{2}|\d{4})?$", label)
+    m = _HOST_LABEL_RE.match(label)
     if not m:
         return "Trade Show"
-    base, year = m.group(1), m.group(2)
-    name = KNOWN_SHOWS.get(base, base.upper())
-    if year:
-        year = year if len(year) == 4 else f"20{year}"
-        return f"{name} {year}"
-    return name
+    base = m.group(1)
+    return KNOWN_SHOWS.get(base, base.upper())
+
+
+def infer_show_year(url: str) -> int | None:
+    """ces2026.mapyourshow.com -> 2026; nab27 -> 2027; nab (no digits in host) -> None."""
+    label = urlparse(url).netloc.lower().split(".")[0] if urlparse(url).netloc else ""
+    m = _HOST_LABEL_RE.match(label)
+    if not m or not m.group(2):
+        return None
+    year = m.group(2)
+    return int(year) if len(year) == 4 else 2000 + int(year)
+
+
+def infer_show_name(url: str) -> str:
+    """ces2026.mapyourshow.com -> 'CES 2026'; nab27 -> 'NAB Show 2027'. Thin wrapper kept for compatibility."""
+    base = infer_show_base(url)
+    year = infer_show_year(url)
+    return f"{base} {year}" if year else base
 
 
 def _clean(text) -> str:
@@ -409,9 +425,14 @@ def scrape_mapyourshow(url: str, log=None) -> tuple[list[dict], dict]:
     log(f"Name filter removed {before - len(rows)} pavilion / association / government listings")
     rows.sort(key=lambda r: (-r["sqft"], r["exhibitor_name"].lower()))
 
+    show_base = infer_show_base(url)
+    show_year = infer_show_year(url)
     meta = {
-        "show_name": infer_show_name(url),
+        "show_name": infer_show_name(url),   # kept for compatibility; prefer show_base/show_year
+        "show_base": show_base,
+        "show_year": show_year,
         "source": "live",
+        "platform": "mapyourshow",
         "url": url,
         "showid": showid,
         "halls": len(wanted),
@@ -488,6 +509,7 @@ def load_fallback_dataset() -> tuple[list[dict], dict]:
             "exhid": f"demo{i}", "detail_url": "", "size_source": "demo",
         })
     rows.sort(key=lambda r: (-r["sqft"], r["exhibitor_name"].lower()))
-    meta = {"show_name": FALLBACK_SHOW, "source": "demo", "url": "", "showid": "DEMO",
+    meta = {"show_name": FALLBACK_SHOW, "show_base": "NAB Show", "show_year": 2027,
+            "source": "demo", "platform": "mapyourshow", "url": "", "showid": "DEMO",
             "halls": 3, "hall_errors": 0, "sized": len(rows), "total": len(rows)}
     return rows, meta

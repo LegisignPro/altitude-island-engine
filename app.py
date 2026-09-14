@@ -27,6 +27,7 @@ import apollo
 import delta_engine
 import freight
 import pitch_generator as pg
+import platforms
 import scraper
 
 # =============================================================================
@@ -40,7 +41,7 @@ DEFAULT_APOLLO_BUDGET = 25
 
 TAB_LABELS = [
     "🎯 Lead Scanner & Directory Extractor",
-    "📈 Newborn Island Delta Engine",
+    "📈 Show Timeline & Newborn Islands",
     "🚚 Vegas Freight & Local Storage Arbitrage",
     "👤 Apollo Contact Enrichment & New Hire Finder",
     "✉️ Pitch Angle Generator & Export",
@@ -87,6 +88,40 @@ def slug(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_").lower() or "export"
 
 
+def current_show_label() -> str:
+    """
+    Single source of truth for the show's display name and year, everywhere the
+    UI, filenames and exports need it. Reads the editable sidebar fields
+    (session_state["show_base"]/["show_year"]), falling back to whatever the
+    scraper inferred from the URL when the user hasn't overridden them. The
+    year is NEVER re-derived from today's date or a target-show calendar --
+    that was the source of the old "+1 year" bug.
+    """
+    meta = st.session_state.get("meta") or {}
+    base = (st.session_state.get("show_base") or "").strip() or (meta.get("show_base") or "Trade Show")
+    year = st.session_state.get("show_year")
+    if year in (None, ""):
+        year = meta.get("show_year")
+    label = f"{base} {int(year)}" if year not in (None, "") else base
+    if meta.get("source") == "demo":
+        label += " (DEMO DATA)"
+    return label
+
+
+def show_file_stub() -> str:
+    """
+    Filename-safe '{show_base}_{show_year}' (year omitted when unknown), built from the
+    same editable fields as current_show_label() but WITHOUT the "(DEMO DATA)" suffix --
+    that belongs on screen, not baked into a file a person might rename and forward.
+    """
+    meta = st.session_state.get("meta") or {}
+    base = (st.session_state.get("show_base") or "").strip() or (meta.get("show_base") or "Trade Show")
+    year = st.session_state.get("show_year")
+    if year in (None, ""):
+        year = meta.get("show_year")
+    return f"{slug(base)}_{int(year)}" if year not in (None, "") else slug(base)
+
+
 # =============================================================================
 # State
 # =============================================================================
@@ -95,9 +130,10 @@ def init_state() -> None:
     st.session_state.setdefault("exhibitors", None)      # DataFrame: every exhibitor extracted
     st.session_state.setdefault("meta", None)            # dict from scraper
     st.session_state.setdefault("extract_log", [])       # progress lines
-    st.session_state.setdefault("prior_df", None)        # DataFrame from delta_engine.load_prior_csv
-    st.session_state.setdefault("prior_name", "")
-    st.session_state.setdefault("prior_error", "")
+    st.session_state.setdefault("show_base", "")          # editable show name (Task 1: year fix)
+    st.session_state.setdefault("show_year", None)        # editable show year, int or None
+    st.session_state.setdefault("timeline_slots", [])     # list of prior-year slot dicts (Task 2)
+    st.session_state.setdefault("_slot_seq", 0)           # stable id generator for slots
     st.session_state.setdefault("orgs", {})              # domain -> apollo.get_organization()
     st.session_state.setdefault("people", {})            # domain -> apollo.search_people()
     st.session_state.setdefault("credits_used", 0)
@@ -115,24 +151,87 @@ def reset_apollo() -> None:
 # rerun and the user stays on the tab they clicked (an explicit st.rerun() would
 # bounce them back to the first tab).
 
-def on_prior_upload() -> None:
-    up = st.session_state.get("prior_upload")
-    st.session_state["prior_error"] = ""
-    if up is None:
+MAX_TIMELINE_SLOTS = 6
+
+
+def add_timeline_slot() -> None:
+    slots = st.session_state["timeline_slots"]
+    if len(slots) >= MAX_TIMELINE_SLOTS:
         return
-    try:
-        st.session_state["prior_df"] = delta_engine.load_prior_csv(up)
-        st.session_state["prior_name"] = up.name
-    except ValueError as exc:
-        st.session_state["prior_df"] = None
-        st.session_state["prior_name"] = ""
-        st.session_state["prior_error"] = str(exc)
+    st.session_state["_slot_seq"] += 1
+    slots.append({"id": st.session_state["_slot_seq"], "year": None, "df": None, "label": "", "error": ""})
 
 
-def clear_prior() -> None:
-    st.session_state["prior_df"] = None
-    st.session_state["prior_name"] = ""
-    st.session_state["prior_error"] = ""
+def remove_timeline_slot(slot_id: int) -> None:
+    st.session_state["timeline_slots"] = [s for s in st.session_state["timeline_slots"] if s["id"] != slot_id]
+
+
+def load_timeline_slot(slot_id: int) -> None:
+    """Load (or reload) one timeline slot from whatever its widgets currently hold."""
+    slot = next((s for s in st.session_state["timeline_slots"] if s["id"] == slot_id), None)
+    if slot is None:
+        return
+    year = st.session_state.get(f"slot_year_{slot_id}")
+    mode = st.session_state.get(f"slot_mode_{slot_id}", "CSV upload")
+    slot["error"] = ""
+    if not year:
+        slot["error"] = "Set a year first."
+        return
+    slot["year"] = int(year)
+    if mode == "CSV upload":
+        up = st.session_state.get(f"slot_csv_{slot_id}")
+        if up is None:
+            slot["error"] = "Choose a CSV file first."
+            return
+        try:
+            prior = delta_engine.load_prior_csv(up)
+            slot["df"] = prior.rename(columns={"prior_name": "exhibitor_name", "prior_sqft": "sqft"}) \
+                               [["exhibitor_name", "sqft"]]
+            slot["label"] = up.name
+        except ValueError as exc:
+            slot["df"] = None
+            slot["error"] = str(exc)
+    else:
+        url = (st.session_state.get(f"slot_url_{slot_id}") or "").strip()
+        if not url:
+            slot["error"] = "Paste a directory URL first."
+            return
+        if not url.startswith("http"):
+            url = "https://" + url
+        try:
+            # facts only: no website fetch, no Apollo -- any supported platform works here
+            rows, meta = platforms.extract_directory(url)
+            slot["df"] = pd.DataFrame(rows, columns=scraper.EXHIBITOR_COLUMNS)[["exhibitor_name", "sqft"]]
+            slot["label"] = meta.get("show_name") or url
+        except scraper.ScrapeError as exc:
+            slot["df"] = None
+            slot["error"] = f"Extraction failed: {exc}"
+        except Exception as exc:  # a bad year/site must not crash the whole app
+            slot["df"] = None
+            slot["error"] = f"Unexpected error: {exc.__class__.__name__}: {exc}"
+
+
+def timeline_slots_for_trajectories() -> list[dict]:
+    """
+    Every loaded prior slot plus the live extraction as the newest slot, ready for
+    delta_engine.build_trajectories(). The live year is the same editable show_year used
+    everywhere else (current_show_label()) -- never re-derived from today's date.
+    """
+    out = []
+    for s in st.session_state["timeline_slots"]:
+        if s.get("df") is not None and s.get("year"):
+            out.append({"year": int(s["year"]), "label": s.get("label") or str(s["year"]),
+                       "source": "prior", "df": s["df"]})
+    live_df = st.session_state.get("exhibitors")
+    if live_df is not None:
+        meta = st.session_state.get("meta") or {}
+        year = st.session_state.get("show_year")
+        if year in (None, ""):
+            year = meta.get("show_year")
+        if year not in (None, ""):
+            out.append({"year": int(year), "label": current_show_label(), "source": "live",
+                       "df": live_df[["exhibitor_name", "sqft"]]})
+    return out
 
 
 def on_run_apollo() -> None:
@@ -174,12 +273,46 @@ def render_sidebar() -> dict:
 
         st.divider()
         st.markdown("**Target show**")
-        url = st.text_input("MapYourShow directory URL",
+        url = st.text_input("Directory / floor-plan URL (MapYourShow, A2Z, EXPOCAD, ExpoFP)",
                             placeholder="https://ces2026.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm",
-                            help="Any page on the show's mapyourshow.com host works; the app derives the JSON endpoints.")
+                            help="Any page on a mapyourshow.com, a2zinc.net/mya2zevents.com, expocad(web).com, "
+                                 "or expofp.com host. MapYourShow is read via its JSON endpoints; the other "
+                                 "three are read by intercepting the JSON their floor plan loads in the "
+                                 "background, which needs a browser and can take longer.")
         allow_demo = st.checkbox("Load demo dataset if the URL fails", value=True,
                                  help="20 fictional exhibitors so the UI can be demonstrated offline. "
                                       "Clearly banded as DEMO DATA whenever shown.")
+
+        # Editable show name/year (Task 1: the "+1 year" fix). Re-seeded from the freshly
+        # extracted meta only when a NEW extraction lands (its extracted_at stamp changes);
+        # otherwise these boxes keep whatever the user last typed, across unrelated reruns
+        # (e.g. a filter change). The year is a plain text field, never a number_input pinned
+        # to today's date -- it is ALWAYS either what this extraction observed or what's typed
+        # here, never derived from the calendar or a target-show list. That derivation was the
+        # source of the old bug.
+        meta_now = st.session_state.get("meta") or {}
+        stamp = meta_now.get("extracted_at", "")
+        if st.session_state.get("_show_fields_synced_at") != stamp:
+            st.session_state["show_base_box"] = st.session_state.get("show_base") or ""
+            prev_year = st.session_state.get("show_year")
+            st.session_state["show_year_box"] = str(prev_year) if prev_year not in (None, "") else ""
+            st.session_state["_show_fields_synced_at"] = stamp
+        sc1, sc2 = st.columns([2, 1])
+        sc1.text_input("Show name", key="show_base_box", placeholder="Inferred after extraction",
+                       help="Editable. Feeds the banner, filenames, export and pitch lines.")
+        sc2.text_input("Show year", key="show_year_box", placeholder="Inferred",
+                       help="Editable 4-digit year. Blank uses the year inferred from the URL for this "
+                            "extraction -- never today's date or a show calendar.")
+        show_base_val = (st.session_state["show_base_box"] or "").strip()
+        year_text = (st.session_state["show_year_box"] or "").strip()
+        show_year_val = None
+        if year_text:
+            if re.fullmatch(r"\d{4}", year_text) and 2015 <= int(year_text) <= 2035:
+                show_year_val = int(year_text)
+            else:
+                st.error("Show year must be a 4-digit year between 2015 and 2035.")
+        st.session_state["show_base"] = show_base_val
+        st.session_state["show_year"] = show_year_val
 
         st.divider()
         st.markdown("**Global filters**")
@@ -212,12 +345,16 @@ def run_extraction(url: str, allow_demo: bool, min_sqft: int, max_sqft: int) -> 
         if url:
             if not url.startswith("http"):
                 url = "https://" + url
-            _log(f"Fetching MapYourShow endpoints for `{url}`")
+            platform = platforms.platform_for(url)
+            _log(f"Detected platform: {platform or 'unrecognised'} for `{url}`")
             try:
-                rows, meta = scraper.scrape_mapyourshow(url, log=_log)
-                targets = [r for r in rows if min_sqft <= r["sqft"] <= max_sqft]
-                _log(f"Fetching websites from detail pages for {len(targets)} in-range exhibitors")
-                scraper.enrich_websites(targets, url, log=_log)
+                rows, meta = platforms.extract_directory(url, log=_log)
+                if meta.get("platform") == "mapyourshow":
+                    # The other platforms already carry a website straight from their own JSON;
+                    # this extra per-exhibitor detail-page fetch is MapYourShow-specific.
+                    targets = [r for r in rows if min_sqft <= r["sqft"] <= max_sqft]
+                    _log(f"Fetching websites from detail pages for {len(targets)} in-range exhibitors")
+                    scraper.enrich_websites(targets, url, log=_log)
             except scraper.ScrapeError as exc:
                 _log(f"Live extraction failed: {exc}")
                 rows = None
@@ -242,10 +379,18 @@ def run_extraction(url: str, allow_demo: bool, min_sqft: int, max_sqft: int) -> 
         st.session_state["exhibitors"] = df
         st.session_state["meta"] = meta
         st.session_state["extract_log"] = log
+        # Pre-fill the editable show name/year from this extraction (Task 1: year
+        # is a fact from THIS scrape, never carried over from a prior run or guessed).
+        st.session_state["show_base"] = meta.get("show_base") or ""
+        st.session_state["show_year"] = meta.get("show_year")
         reset_apollo()
-        status.update(label=f"Extracted {len(df)} exhibitors from {meta['show_name']}"
-                            + (" (live MapYourShow)" if meta["source"] == "live" else ""),
+        platform_txt = f" (live {meta.get('platform', 'mapyourshow')})" if meta["source"] == "live" else ""
+        status.update(label=f"Extracted {len(df)} exhibitors from {meta['show_name']}{platform_txt}",
                       state="complete", expanded=False)
+    # Rerun once so the sidebar's Show name/year inputs (rendered before this
+    # function runs) immediately reflect the freshly extracted values instead
+    # of lagging one interaction behind. Tab selection survives via key="main_tabs".
+    st.rerun()
 
 
 # =============================================================================
@@ -255,11 +400,26 @@ def run_extraction(url: str, allow_demo: bool, min_sqft: int, max_sqft: int) -> 
 def build_targets(params: dict) -> pd.DataFrame:
     """Filtered islands with delta, Apollo org, primary contact, freight tag, and pitch columns."""
     df: pd.DataFrame = st.session_state["exhibitors"]
-    meta = st.session_state["meta"]
     targets = df[(df["sqft"] >= params["min_sqft"]) & (df["sqft"] <= params["max_sqft"])].copy()
 
-    # Year-over-year delta
-    targets = delta_engine.compute_delta(targets, st.session_state.get("prior_df"))
+    # Year-over-year delta + multi-year trajectory (Task 2), fed by the timeline slots with the
+    # live extraction always the newest one. With zero or one slot loaded every company falls
+    # back to NO PRIOR DATA, identical to the old single-upload behaviour.
+    traj = delta_engine.build_trajectories(timeline_slots_for_trajectories())
+    targets["name_key"] = targets["exhibitor_name"].map(delta_engine.name_key)
+    traj_cols = ["name_key", "prior_sqft", "delta_sqft", "trajectory", "yoy_status", "newborn_island",
+                "peak_sqft", "peak_year"]
+    if not traj.empty:
+        targets = targets.merge(traj[traj_cols], on="name_key", how="left")
+    else:
+        for c in traj_cols[1:]:
+            targets[c] = pd.NA
+    targets = targets.drop(columns=["name_key"])
+    # A target absent from every timeline slot (shouldn't happen -- the live extraction IS a
+    # slot -- but stay defensive) reads the same as "no prior data" rather than blank/NaN.
+    targets["yoy_status"] = targets["yoy_status"].fillna(delta_engine.STATUS_NONE)
+    targets["trajectory"] = targets["trajectory"].fillna(delta_engine.STATUS_NONE)
+    targets["newborn_island"] = targets["newborn_island"].fillna(False).astype(bool)
 
     # Apollo organisation + primary contact
     orgs: dict = st.session_state["orgs"]
@@ -309,7 +469,7 @@ def build_targets(params: dict) -> pd.DataFrame:
     targets["region"] = [freight.region_of(s, c) for s, c in zip(targets["hq_state"], targets["hq_country"])]
     targets["freight_tag"] = [freight.freight_tag(s, c) for s, c in zip(targets["hq_state"], targets["hq_country"])]
 
-    targets = pg.assign_pitches(targets, meta["show_name"])
+    targets = pg.assign_pitches(targets, current_show_label())
     return targets
 
 
@@ -344,9 +504,11 @@ def source_banner(meta: dict) -> None:
     if meta["source"] == "demo":
         st.warning("DEMO DATA: the directory could not be read (or no URL was entered), so the 20 fictional "
                    "exhibitors below are placeholders for the UI walk-through. Nothing here is a real company.")
-    pills = ("<span class='ax-pill ax-live'>Live MapYourShow</span>" if meta["source"] == "live"
+    platform_label = {"mapyourshow": "MapYourShow", "a2z": "A2Z", "expocad": "EXPOCAD",
+                      "expofp": "ExpoFP"}.get(meta.get("platform"), "MapYourShow")
+    pills = (f"<span class='ax-pill ax-live'>Live {platform_label}</span>" if meta["source"] == "live"
              else "<span class='ax-pill ax-demo'>Demo data</span>")
-    pills += f"<span class='ax-pill ax-info'>{meta['show_name']}</span>"
+    pills += f"<span class='ax-pill ax-info'>{current_show_label()}</span>"
     if meta.get("halls"):
         pills += f"<span class='ax-pill ax-info'>{meta['halls']} halls</span>"
     st.markdown(pills, unsafe_allow_html=True)
@@ -461,45 +623,119 @@ def tab_scanner(params: dict, all_df: pd.DataFrame, targets: pd.DataFrame, meta:
                    f"Exhibitors without geometry show 0 sq ft and never enter the target list.")
     st.download_button("Download full extraction CSV (use as next year's prior-year file)",
                        data=all_df.to_csv(index=False).encode("utf-8"),
-                       file_name=f"{slug(meta['show_name'])}_exhibitors.csv", mime="text/csv")
+                       file_name=f"{show_file_stub()}_exhibitors.csv", mime="text/csv")
 
 
-def tab_delta(params: dict, targets: pd.DataFrame, meta: dict) -> None:
-    st.markdown("#### Year-over-year footprint delta")
-    st.caption(md("Upload last year's extraction for the same show. Any CSV with an exhibitor-name column and a "
-                  "sq-ft column (or width + length) works. A jump from under 200 sq ft to 400+ sq ft is flagged "
-                  "CRITICAL: NEWBORN ISLAND, the strongest observed buying signal in the engine."))
-    st.file_uploader("Prior-year MapYourShow CSV", type=["csv"], key="prior_upload", on_change=on_prior_upload)
-    c1, c2 = st.columns([1, 3])
-    if st.session_state.get("prior_error"):
-        st.error(st.session_state["prior_error"])
-    if st.session_state.get("prior_df") is not None:
-        c1.success(f"Prior file: {st.session_state['prior_name']} ({len(st.session_state['prior_df'])} companies)")
-        c2.button("Clear prior-year file", on_click=clear_prior)
-    else:
-        c1.info("No prior-year file loaded.")
+TRAJ_STYLES = {
+    delta_engine.TRAJ_NEWBORN: "background-color: #ef4444; color: white; font-weight: 700",
+    delta_engine.TRAJ_PEAK_RETREAT: f"background-color: {pg.TRIGGERS[pg.TRIGGER_E]['hex']}; color: white; font-weight: 700",
+    delta_engine.TRAJ_STEADY_GROWTH: "background-color: rgba(34,197,94,.3); font-weight: 600",
+    delta_engine.TRAJ_SHRINKING: "background-color: rgba(100,116,139,.3)",
+    delta_engine.TRAJ_VOLATILE: "background-color: rgba(139,92,246,.28); font-weight: 600",
+    delta_engine.TRAJ_UPGRADE: "background-color: rgba(34,197,94,.18)",
+    delta_engine.TRAJ_DOWNSIZE: "background-color: rgba(100,116,139,.18)",
+    delta_engine.TRAJ_NEW: "background-color: rgba(59,130,246,.2)",
+}
+
+
+def render_timeline_slot(slot: dict) -> None:
+    sid = slot["id"]
+    with st.container(border=True):
+        c1, c2, c3 = st.columns([1, 2, 1])
+        c1.number_input("Year", min_value=2015, max_value=2035, step=1,
+                        value=slot["year"] or 2025, key=f"slot_year_{sid}")
+        mode = c2.radio("Source", ["CSV upload", "MapYourShow URL"], key=f"slot_mode_{sid}", horizontal=True)
+        c3.markdown("&nbsp;", unsafe_allow_html=True)   # align the Remove button with the row above
+        c3.button("Remove slot", key=f"slot_remove_{sid}", on_click=remove_timeline_slot, args=(sid,),
+                  width="stretch")
+        if mode == "CSV upload":
+            st.file_uploader("Prior-year CSV (this app's export, or any file with a name + sq-ft column)",
+                             type=["csv"], key=f"slot_csv_{sid}")
+        else:
+            st.text_input("MapYourShow directory URL for that year's show", key=f"slot_url_{sid}",
+                          placeholder="https://nab26.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm")
+        lc1, lc2 = st.columns([1, 3])
+        lc1.button("Load", key=f"slot_load_{sid}", type="primary", on_click=load_timeline_slot, args=(sid,))
+        if slot.get("error"):
+            lc2.error(slot["error"])
+        elif slot.get("df") is not None:
+            lc2.success(f"{slot.get('label') or 'Loaded'}: {len(slot['df'])} companies, year {slot['year']}")
+        else:
+            lc2.caption("Not loaded yet.")
+
+
+def tab_timeline(params: dict, targets: pd.DataFrame) -> None:
+    st.markdown("#### Multi-year show timeline")
+    st.caption(md(
+        "Add prior years as a CSV (this app's own export, or any file with a name and sq-ft column) or a "
+        "MapYourShow directory URL for that year's show -- up to 6 years total. With three or more years on "
+        "file the engine sees the SHAPE of a company's booth history, not just one delta: a booth that grew "
+        "to a peak and pulled back (small -> large -> medium) is flagged PEAK RETREAT, likely shopping for a "
+        "new exhibit partner to make a splash again. A jump from under 200 to 400+ sq ft is still flagged "
+        "CRITICAL: NEWBORN ISLAND, the strongest single signal in the engine."
+    ))
+    slots = st.session_state["timeline_slots"]
+    for slot in slots:
+        render_timeline_slot(slot)
+    st.button(f"+ Add prior year ({len(slots)}/{MAX_TIMELINE_SLOTS})", on_click=add_timeline_slot,
+             disabled=len(slots) >= MAX_TIMELINE_SLOTS)
+
+    all_slots = timeline_slots_for_trajectories()
+    if len(all_slots) <= 1:
+        st.info("Add at least one prior year above (and load it) to unlock trajectory flags like "
+               "NEWBORN ISLAND and PEAK RETREAT.")
         return
 
-    live = targets[~targets["oversized"]]
-    s = delta_engine.delta_summary(live)
+    traj = delta_engine.build_trajectories(all_slots)
+    cur = traj[traj["is_current_year"]]
+    s = delta_engine.trajectory_summary(traj)
     m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Newborn islands", s["newborn"])
-    m2.metric("Upgrades", s["upgrade"])
-    m3.metric("Stagnant", s["stagnant"])
-    m4.metric("Downsized", s["downsize"])
-    m5.metric("New to show", s["new"])
+    m1.metric("Newborn islands", s.get("newborn", 0))
+    m2.metric("Peak retreats", s.get("peak_retreat", 0))
+    m3.metric("Steady growth", s.get("steady_growth", 0))
+    m4.metric("Shrinking", s.get("shrinking", 0))
+    m5.metric("New to show", s.get("new", 0))
 
-    cols = ["exhibitor_name", "booth_number", "sqft", "prior_sqft", "delta_sqft", "yoy_status", "website"]
-    view = live.sort_values(["newborn_island", "delta_sqft"], ascending=[False, False])[cols]
-    status_styles = {
-        delta_engine.STATUS_NEWBORN: "background-color: #ef4444; color: white; font-weight: 700",
-        delta_engine.STATUS_UPGRADE: "background-color: rgba(34,197,94,.25); font-weight: 600",
-        delta_engine.STATUS_DOWNSIZE: "background-color: rgba(100,116,139,.25)",
-        delta_engine.STATUS_NEW: "background-color: rgba(59,130,246,.2)",
+    years = sorted(int(y["year"]) for y in all_slots)
+    year_cols = [f"sqft_{y}" for y in years]
+    cols = ["exhibitor_name"] + year_cols + ["peak_sqft", "peak_year", "current_sqft", "delta_sqft", "trajectory"]
+    target_names = set(targets["exhibitor_name"]) if not targets.empty else set()
+    view = cur[cur["exhibitor_name"].isin(target_names)].copy() if target_names else cur.iloc[0:0].copy()
+    if view.empty:
+        st.info("No target islands (within the sidebar's sq-ft filter) have timeline data yet.")
+        return
+    view = view.sort_values(["trajectory", "current_sqft"], ascending=[True, False])
+
+    # Streamlit 1.63's column_config.NumberColumn renders a missing value as the literal
+    # text "None" -- confirmed to happen for a NaN float, a pandas-nullable Int64 pd.NA, and
+    # even a blank string coerced through NumberColumn's own numeric parsing; the Styler's
+    # na_rep is bypassed entirely once a column has a NumberColumn. A company absent from a
+    # given year is the COMMON case here (most exhibitors don't appear in every slot), so
+    # that literal "None" would be the single most visible thing on this tab. The only
+    # rendering path that shows a true blank is a pre-formatted string column under
+    # TextColumn, so year sq-ft and the prior-year delta are formatted here by hand; peak/
+    # current sq ft and peak year are never NaN for a current-year row and keep NumberColumn.
+    disp = view[cols].copy()
+    for yc in year_cols:
+        disp[yc] = disp[yc].map(lambda v: "" if pd.isna(v) else f"{v:,.0f}")
+    disp["delta_sqft"] = disp["delta_sqft"].map(lambda v: "" if pd.isna(v) else f"{v:+,.0f}")
+
+    cfg = {
+        "exhibitor_name": st.column_config.TextColumn("Exhibitor", width="medium"),
+        "peak_sqft": st.column_config.NumberColumn("Peak sq ft", format="%d", width="small"),
+        "peak_year": st.column_config.NumberColumn("Peak year", format="%d", width="small"),
+        "current_sqft": st.column_config.NumberColumn("Current sq ft", format="%d", width="small"),
+        "delta_sqft": st.column_config.TextColumn("Delta vs prior", width="small"),
+        "trajectory": st.column_config.TextColumn("Trajectory", width="medium"),
     }
-    styled = view.style.apply(lambda s_: [status_styles.get(v, "") for v in s_], subset=["yoy_status"]) \
-        .format({"prior_sqft": "{:,.0f}", "delta_sqft": "{:+,.0f}"}, na_rep="")
-    show_table(view, cols, params["max_sqft"], key="grid_delta", styled=styled)
+    fmt_map = {c: "{:,.0f}" for c in ["peak_sqft", "current_sqft"]}
+    fmt_map["peak_year"] = "{:.0f}"
+    for yc in year_cols:
+        cfg[yc] = st.column_config.TextColumn(yc.replace("sqft_", ""), width="small")
+    styled = disp.style.apply(lambda ser: [TRAJ_STYLES.get(v, "") for v in ser], subset=["trajectory"]) \
+        .format(fmt_map, na_rep="")
+    st.dataframe(styled, column_config=cfg, hide_index=True, width="stretch", key="grid_timeline",
+                height=min(60 + 35 * max(len(view), 1), 560))
 
 
 def tab_freight(params: dict, targets: pd.DataFrame) -> None:
@@ -637,7 +873,7 @@ def tab_pitch(params: dict, targets: pd.DataFrame, meta: dict) -> None:
         st.info("No target islands to pitch. Run an extraction first.")
         return
     counts = live["trigger_badge"].value_counts()
-    m = st.columns(4)
+    m = st.columns(len(pg.TRIGGERS))
     for col, code in zip(m, pg.TRIGGERS):
         col.metric(pg.TRIGGERS[code]["badge"], int(counts.get(pg.TRIGGERS[code]["badge"], 0)))
 
@@ -680,18 +916,22 @@ def tab_pitch(params: dict, targets: pd.DataFrame, meta: dict) -> None:
         if row["yoy_status"] not in (delta_engine.STATUS_NONE,):
             facts.append(f"YoY: {row['yoy_status']}"
                          + (f" ({int(row['prior_sqft']):,} -> {int(row['sqft']):,} sq ft)" if pd.notna(row["prior_sqft"]) else ""))
+        if row.get("trajectory") and row["trajectory"] not in (row["yoy_status"], delta_engine.STATUS_NONE):
+            peak_txt = (f" (peak {int(row['peak_sqft']):,} sq ft in {int(row['peak_year'])})"
+                       if pd.notna(row.get("peak_sqft")) and pd.notna(row.get("peak_year")) else "")
+            facts.append(f"Multi-year trajectory: {row['trajectory']}{peak_txt}")
         if row["apollo_source"]:
             facts.append(f"Firmographics source: {row['apollo_source']}")
         st.markdown("\n".join(f"- {md(f)}" for f in facts))
 
     st.markdown("##### Export")
-    export_df = pg.build_export(contact_level(view, meta["show_name"]), meta["show_name"])
+    export_df = pg.build_export(contact_level(view, current_show_label()), current_show_label())
     n_with_email = int((export_df["email"] != "").sum()) if not export_df.empty else 0
     st.caption(f"{len(export_df)} rows ({n_with_email} with an email). Columns: {', '.join(pg.EXPORT_COLUMNS[:11])}. "
                "Import into Instantly or Smartlead and map custom_intro_line to a custom variable.")
     st.download_button("Download campaign CSV (Instantly / Smartlead)",
                        data=export_df.to_csv(index=False).encode("utf-8"),
-                       file_name=f"{slug(meta['show_name'])}_campaign.csv", mime="text/csv", type="primary")
+                       file_name=f"{show_file_stub()}_campaign.csv", mime="text/csv", type="primary")
 
 
 # =============================================================================
@@ -707,7 +947,8 @@ def render_empty_state() -> None:
             "gallery and the floor-plan booth geometry, then joins them for exact booth footprints.\n"
             "2. The sq-ft filter keeps island exhibitors (default 400 to 3,000 sq ft). Pavilions, associations "
             "and government stands are removed.\n"
-            "3. Tab 2: upload last year's extraction to find companies that just jumped from an inline to an island.\n"
+            "3. Tab 2: add one or more prior years (CSV or URL) to flag companies that just jumped from an "
+            "inline to an island, or that grew to a peak and pulled back -- likely shopping for a new partner.\n"
             "4. Tab 4: Apollo adds employee count, HQ state and buyer contacts (new hires flagged).\n"
             "5. Tab 3 and Tab 5: freight arbitrage tags, one pitch angle per company, CSV for Instantly / Smartlead."
         ))
@@ -746,7 +987,7 @@ def main() -> None:
     with tabs[0]:
         tab_scanner(params, all_df, targets, meta)
     with tabs[1]:
-        tab_delta(params, targets, meta)
+        tab_timeline(params, targets)
     with tabs[2]:
         tab_freight(params, targets)
     with tabs[3]:
