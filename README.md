@@ -13,9 +13,12 @@ Optional: put the Apollo master key in `.streamlit/secrets.toml` (locally) or
 App settings > Secrets (Streamlit Community Cloud):
 
     APOLLO_API_KEY = "xxxxxxxx"
+    TAVILY_API_KEY = "tvly-xxxxxxxx"   # optional: enables "Find the directory URL for me"
 
-Without a key the sidebar defaults to **mock Apollo responses**: deterministic
-placeholder firmographics labelled MOCK in every table and in the export.
+Without an Apollo key the sidebar defaults to **mock Apollo responses**:
+deterministic placeholder firmographics labelled MOCK in every table and in
+the export. Without a Tavily key the finder is shown disabled with a one-line
+hint; nothing else changes.
 
 ## Files
 
@@ -24,7 +27,8 @@ placeholder firmographics labelled MOCK in every table and in the export.
 | `app.py` | Streamlit UI: sidebar, 5 tabs, metrics, tables, export |
 | `scraper.py` | MapYourShow JSON endpoints (halls, gallery, floor-plan geometry, detail-page websites) + demo fallback |
 | `platforms.py` | Routes a directory URL to the right scraper by host (MapYourShow, A2Z, EXPOCAD, ExpoFP) |
-| `browser_scraper.py` | Playwright network-interception extraction for A2Z/EXPOCAD/ExpoFP (canvas/SVG floor plans) + capture-first CLI |
+| `browser_scraper.py` | Playwright network-interception extraction for A2Z/EXPOCAD/ExpoFP (canvas/SVG floor plans): fuzzy field-role resolution, value-overlap join discovery, graceful partial results + capture-first CLI |
+| `show_finder.py` | "Find it for me": Tavily search for a show's directory URL(s) by name, current + prior years, every hit content-verified before it is offered |
 | `delta_engine.py` | Prior-year CSV/URL join, sq-ft delta, `CRITICAL: NEWBORN ISLAND` flag, multi-year trajectory classification (PEAK RETREAT, STEADY GROWTH, ...) |
 | `freight.py` | HQ state -> freight arbitrage tag |
 | `apollo.py` | Organisation enrichment (1 credit), people search (0 credits), new-hire flag, mock mode |
@@ -34,7 +38,14 @@ placeholder firmographics labelled MOCK in every table and in the export.
 ## Workflow
 
 1. Sidebar: paste any directory / floor-plan URL (MapYourShow, A2Z, EXPOCAD or
-   ExpoFP), set the sq-ft range, click **Run Extraction**. Pavilions,
+   ExpoFP) -- or, with a Tavily key, open **Find the directory URL for me**,
+   type the show's name and let the engine search for the current edition's
+   directory and up to 5 prior editions. Only URLs whose page content was
+   extracted and verified as an exhibitor listing are offered (a same-pattern
+   guess like nab24.mapyourshow.com returns HTTP 200 with the marketing
+   homepage -- a 200 is never treated as proof). The per-year summary is the
+   honest answer to "how many years of maps exist": whatever search can still
+   find AND verify. Set the sq-ft range, click **Run Extraction**. Pavilions,
    associations, "State of" and "Department" listings are removed. Websites
    are fetched from the exhibitor detail pages for in-range MapYourShow
    exhibitors only (the other platforms carry a website in their own JSON).
@@ -63,26 +74,49 @@ Emails: Apollo people search never reveals addresses (the Free plan blocks
 Instantly / Smartlead's finder fill it, or wire `apollo.reveal_email()` on a
 paid plan.
 
-## Adding a new floor-plan platform
+## Adding a new floor-plan platform / tuning the browser normalisers
 
 A2Z, EXPOCAD and ExpoFP render exhibitor/booth data via canvas or SVG, not
 HTML, so `browser_scraper.py` intercepts the JSON their own JavaScript fetches
-from the network layer instead of parsing markup. The field names used in each
-normaliser (`normalize_a2z`, `normalize_expocad`, `normalize_expofp`) are
-**hypotheses**, not verified against a real show -- this container's egress
-cannot reach a2zinc.net / expocad.com / expofp.com. To tune them against a
-real show from a machine that can reach it:
+from the network layer instead of parsing markup. The field names each
+platform uses are **hypotheses** -- this container's egress cannot reach
+a2zinc.net / expocad.com / expofp.com -- and the first live EXPOCAD run
+(swe.expocad.com, WE26) captured five JSON responses and produced zero rows
+because the normaliser then demanded an exact alias hit on every field of one
+assumed shape. The normalisers are now built to bend instead of break:
+
+- **Roles, not fixed keys.** Each record array is profiled once: every key
+  path (nested objects and sub-record lists included) is matched against
+  `ROLE_ALIASES` (name, booth number, booth id, company id, area, width,
+  length, polygon, website, hall) in confidence tiers -- exact, nested leaf,
+  substring, fuzzy edit distance -- and every hit is sanity-checked against
+  the actual values (an "Area" holding "North Hall" is not an area).
+- **Joins are discovered, not assumed.** Booth arrays and exhibitor arrays
+  are linked by whichever id-shaped fields actually share values; several
+  per-hall booth arrays that link to the same exhibitor list are merged.
+- **Partial beats nothing.** Strict join -> single self-contained array ->
+  best-effort names-only. An exhibitor with no readable footprint is a row
+  with 0 sq ft and `size_source=unknown`; a footprint read through a fuzzy
+  field match is tagged `<platform>-json-fuzzy` so it is visibly lower
+  confidence in the table and the export. Nothing is ever invented.
+- **Failures explain themselves.** The extraction log (and the error when
+  zero rows result) lists the arrays seen, their keys, which roles resolved
+  to which key and which strategy was used.
+
+For deep debugging against a real show from a machine that can reach it:
 
     python browser_scraper.py capture <url> --out captures/<slug>.json
-    python browser_scraper.py capture <url> --normalise a2z
+    python browser_scraper.py capture <url> --normalise expocad
 
-The first command dumps every captured JSON response's shape and a sample
-record; the second also runs the normaliser and prints a row-count summary so
-the alias lists in `pick(...)` calls can be adjusted to match what actually
-came back.
+If a real payload uses a spelling the fuzzy matcher still misses, add it to
+`ROLE_ALIASES` and a fixture under `tests/fixtures/` modelling that shape.
 
 ## Tests
 
-    python tests/test_modules.py         # scraper vs mock MapYourShow server, show year, delta, trajectories, freight, pitch, Apollo mock
+    python tests/test_modules.py         # scraper vs mock MapYourShow server, show year, delta, trajectories, freight, pitch, Apollo mock, show finder (mocked Tavily)
     python tests/test_app.py             # headless Streamlit flow: extraction -> timeline -> Apollo -> pitch -> export
-    python tests/test_browser_scraper.py # A2Z/EXPOCAD/ExpoFP normalisers against fixtures + a real local Playwright capture
+    python tests/test_browser_scraper.py # A2Z/EXPOCAD/ExpoFP normalisers against happy-path AND weird-shape fixtures + a real local Playwright capture
+
+The live Tavily network path (api.tavily.com) is unreachable from the build
+container, so `show_finder.py`'s decision logic is tested against a mocked
+client; its SDK call shape follows tavily-python's documented API.

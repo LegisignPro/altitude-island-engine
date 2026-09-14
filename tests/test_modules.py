@@ -16,6 +16,7 @@ import freight  # noqa: E402
 import pitch_generator as pg  # noqa: E402
 import platforms  # noqa: E402
 import scraper  # noqa: E402
+import show_finder  # noqa: E402
 
 PORT = 8765
 
@@ -257,6 +258,122 @@ def test_platform_detection():
     print("platform detection OK")
 
 
+# ---------------------------------------------------------------------------
+# show_finder: query construction, verification heuristic, platform labelling and result
+# assembly against a MOCKED Tavily client. The live api.tavily.com path cannot be reached from
+# the build container, so the decision logic is what gets covered here.
+# ---------------------------------------------------------------------------
+
+REAL_DIRECTORY = ("NAB Show 2026 Exhibitor Directory. Browse exhibitors by hall. Booth SL1523 ... "
+                  "Floor plan. 400 sq ft island booths ...")
+STALE_HOMEPAGE = ("NAB Show - Register today! Get notified when registration opens. Exhibitor info, "
+                  "booth sales open now. Book housing.")
+TEASER_PAGE = "Explore the 3D floor plan preview. Coming soon."
+FLIPBOOK_2025 = "NAB 2025 Show Directory. Adobe SL1523, SL1723 ... Exhibitor listings by booth number."
+SEMA_WHITELABEL = "Floor plan {BOOTHID} {AVAILBOOTHSQFEET} exhibitor booth tooltip template"
+
+
+class MockTavily:
+    """Canned responses keyed by query / url, plus call counting so tests can prove nothing unverified
+    leaks through and nothing is fetched twice."""
+
+    def __init__(self, searches: dict, pages: dict, fail_extract: tuple = ()):
+        self.searches, self.pages, self.fail_extract = searches, pages, fail_extract
+        self.search_calls, self.extract_calls = [], []
+
+    def search(self, query, **kw):
+        self.search_calls.append(query)
+        return {"results": [{"url": u, "title": t, "content": ""} for u, t in self.searches.get(query, [])]}
+
+    def extract(self, urls, **kw):
+        self.extract_calls.append(list(urls))
+        return {"results": [{"url": u, "raw_content": self.pages[u]} for u in urls if u in self.pages],
+                "failed_results": [{"url": u, "error": "403"} for u in urls if u in self.fail_extract]}
+
+
+class ExplodingTavily:
+    def search(self, *a, **kw):
+        raise ConnectionError("proxy 403")
+
+    def extract(self, *a, **kw):
+        raise ConnectionError("proxy 403")
+
+
+def test_show_finder():
+    assert show_finder.build_query("  NAB   Show ") == "NAB Show exhibitor directory floor plan"
+    assert show_finder.build_query("SEMA Show", 2025) == "SEMA Show 2025 exhibitor directory floor plan"
+
+    assert show_finder.looks_like_directory(REAL_DIRECTORY)
+    assert show_finder.looks_like_directory(FLIPBOOK_2025)
+    assert show_finder.looks_like_directory(SEMA_WHITELABEL)
+    assert not show_finder.looks_like_directory(STALE_HOMEPAGE), "homepage tells must veto a 200"
+    assert not show_finder.looks_like_directory(TEASER_PAGE), "one tell is not enough"
+    assert not show_finder.looks_like_directory("")
+
+    # platform labelling reuses platforms.platform_for (host + white-label path), then content
+    assert show_finder.classify_platform("https://nab26.mapyourshow.com/8_0/explore/exhview.cfm") == "mapyourshow"
+    assert show_finder.classify_platform("https://exhibitors.ces.tech/8_0/explore/exhibitor-gallery.cfm") == "mapyourshow"
+    assert show_finder.classify_platform("https://a2z.aafp.org/Public/EventMap.aspx?ID=1") == "a2z"
+    assert show_finder.classify_platform("https://www.semashow.com/floorplan", SEMA_WHITELABEL) == "expocad"
+    assert show_finder.classify_platform("https://user-123.cld.bz/NAB-2025-Show-Directory", FLIPBOOK_2025) is None
+
+    assert show_finder.years_to_probe(2026, 2) == [2025, 2024]
+    assert show_finder.years_to_probe(2026, 0) == []
+    assert show_finder.years_to_probe(2026, 99) == [2025, 2024, 2023, 2022, 2021]   # capped
+    assert len(show_finder.years_to_probe(None, 1)) == 1
+
+    q0, q25, q24 = (show_finder.build_query("NAB Show", y) for y in (None, 2025, 2024))
+    mock = MockTavily(
+        searches={
+            q0: [("https://nab26.mapyourshow.com/8_0/explore/exhview.cfm", "NAB Show 2026 Exhibitors"),
+                 ("https://nab24.mapyourshow.com/8_0/explore/exhview.cfm", "NAB Show"),        # 200 but stale homepage
+                 ("https://nabshow.com/blocked", "blocked"),                                   # extract fails
+                 ("https://nab26.mapyourshow.com/8_0/explore/exhview.cfm/", "dup")],          # duplicate
+            q25: [("https://user-35215390377.cld.bz/NAB-2025-Show-Directory", "NAB 2025 Show Directory")],
+            q24: [("https://nab24.expofp.com/", "3D floor plan")],
+        },
+        pages={
+            "https://nab26.mapyourshow.com/8_0/explore/exhview.cfm": REAL_DIRECTORY,
+            "https://nab24.mapyourshow.com/8_0/explore/exhview.cfm": STALE_HOMEPAGE,
+            "https://user-35215390377.cld.bz/NAB-2025-Show-Directory": FLIPBOOK_2025,
+            "https://nab24.expofp.com/": TEASER_PAGE,
+        },
+        fail_extract=("https://nabshow.com/blocked",),
+    )
+    log = []
+    res = show_finder.find_show_urls("NAB Show", years=[2025, 2024], client=mock, log=log.append)
+    assert mock.search_calls == [q0, q25, q24]
+    assert len(mock.extract_calls) == 3 and len(mock.extract_calls[0]) == 3, mock.extract_calls   # deduped before extract
+    cur = res["current"]
+    assert [h["url"] for h in cur] == ["https://nab26.mapyourshow.com/8_0/explore/exhview.cfm"], cur
+    assert cur[0]["platform"] == "mapyourshow" and cur[0]["supported"] and cur[0]["url_year"] == 2026
+    # the stale-homepage 200 and the failed fetch are NOT offered -- unverified never leaks out
+    assert all("nab24" not in h["url"] and "blocked" not in h["url"] for h in cur)
+    assert [h["url"] for h in res["by_year"][2025]] == ["https://user-35215390377.cld.bz/NAB-2025-Show-Directory"]
+    assert res["by_year"][2025][0]["supported"] is False and res["by_year"][2025][0]["platform"] is None
+    assert res["by_year"][2024] == []
+    assert res["years_with_maps"] == [2025] and res["years_probed"] == [2025, 2024]
+    summary = show_finder.summarize_years(res)
+    assert "1 of 2" in summary and "2025: 1 verified" in summary and "2024: none found" in summary, summary
+    assert any("verified as a real exhibitor listing: 1" in line for line in log), log
+
+    # failure modes surface as ShowFinderError, never a raw exception
+    for bad in (lambda: show_finder.find_show_urls("", client=mock),
+                lambda: show_finder.find_show_urls("NAB Show", api_key=""),
+                lambda: show_finder.find_show_urls("NAB Show", client=ExplodingTavily())):
+        try:
+            bad()
+            raise AssertionError("expected ShowFinderError")
+        except show_finder.ShowFinderError as exc:
+            assert str(exc)
+    try:
+        show_finder.find_show_urls("NAB Show", client=ExplodingTavily())
+    except show_finder.ShowFinderError as exc:
+        assert "ConnectionError" in str(exc)
+    assert show_finder.summarize_years({"years_probed": []}) == ""
+    print("show_finder OK")
+
+
 if __name__ == "__main__":
     proc = start_server()
     try:
@@ -269,6 +386,7 @@ if __name__ == "__main__":
         test_freight()
         test_apollo_mock_and_pitch(delta_df)
         test_platform_detection()
+        test_show_finder()
         print("\nALL MODULE TESTS PASSED")
     finally:
         proc.terminate()

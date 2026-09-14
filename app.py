@@ -10,6 +10,7 @@ Modules
     freight.py          HQ-based freight arbitrage tagging
     apollo.py           Apollo organisation enrichment + people search (live or mock)
     pitch_generator.py  trigger hierarchy, intro lines, Instantly/Smartlead export
+    show_finder.py      Tavily search + content verification: show name -> directory URL(s), by year
 
 Every number on screen is either an observed MapYourShow fact, an Apollo
 firmographic, or a value computed from those two. Nothing is modelled.
@@ -29,6 +30,7 @@ import freight
 import pitch_generator as pg
 import platforms
 import scraper
+import show_finder
 
 # =============================================================================
 # Config
@@ -138,6 +140,9 @@ def init_state() -> None:
     st.session_state.setdefault("people", {})            # domain -> apollo.search_people()
     st.session_state.setdefault("credits_used", 0)
     st.session_state.setdefault("apollo_log", [])
+    st.session_state.setdefault("finder", None)          # show_finder.find_show_urls() result
+    st.session_state.setdefault("finder_error", "")
+    st.session_state.setdefault("tavily_key", "")
 
 
 def reset_apollo() -> None:
@@ -172,13 +177,13 @@ def load_timeline_slot(slot_id: int) -> None:
     if slot is None:
         return
     year = st.session_state.get(f"slot_year_{slot_id}")
-    mode = st.session_state.get(f"slot_mode_{slot_id}", "CSV upload")
+    mode = st.session_state.get(f"slot_mode_{slot_id}", SLOT_MODE_CSV)
     slot["error"] = ""
     if not year:
         slot["error"] = "Set a year first."
         return
     slot["year"] = int(year)
-    if mode == "CSV upload":
+    if mode == SLOT_MODE_CSV:
         up = st.session_state.get(f"slot_csv_{slot_id}")
         if up is None:
             slot["error"] = "Choose a CSV file first."
@@ -242,6 +247,89 @@ def on_run_apollo() -> None:
     run_apollo(params, targets)
 
 
+# --- "Find it for me" (show_finder) -------------------------------------------------------------
+# The finder only ever offers URLs whose page content has been extracted and verified as an
+# exhibitor listing (show_finder.looks_like_directory); a search hit that failed verification is
+# not shown at all. These callbacks fill widgets, so they must run before the widgets render.
+
+SLOT_MODE_CSV, SLOT_MODE_URL = "CSV upload", "Directory URL"
+
+
+def use_found_url(url: str) -> None:
+    st.session_state["url_box"] = url
+
+
+def send_found_to_slot(year: int, url: str) -> None:
+    """Put a verified prior-year URL into the timeline slot for that year (creating one if needed)."""
+    slots = st.session_state["timeline_slots"]
+    slot = next((sl for sl in slots if st.session_state.get(f"slot_year_{sl['id']}", sl.get("year")) == year), None)
+    if slot is None:
+        if len(slots) >= MAX_TIMELINE_SLOTS:
+            return
+        add_timeline_slot()
+        slot = slots[-1]
+        slot["year"] = year
+    sid = slot["id"]
+    st.session_state[f"slot_year_{sid}"] = year
+    st.session_state[f"slot_mode_{sid}"] = SLOT_MODE_URL
+    st.session_state[f"slot_url_{sid}"] = url
+
+
+def run_show_finder(show: str, years: list[int]) -> None:
+    """Search + verify; the result (or the plain-English failure) lands in session state."""
+    st.session_state["finder_error"] = ""
+    try:
+        st.session_state["finder"] = show_finder.find_show_urls(
+            show, years=years, api_key=st.session_state.get("tavily_key", ""))
+    except show_finder.ShowFinderError as exc:
+        st.session_state["finder_error"] = str(exc)
+    except Exception as exc:   # never let a lookup take the page down
+        st.session_state["finder_error"] = f"Unexpected error: {exc.__class__.__name__}: {exc}"
+
+
+def run_show_finder_year(show: str, year: int) -> None:
+    """Probe ONE prior year from a timeline slot and merge it into the existing finder result."""
+    st.session_state["finder_error"] = ""
+    try:
+        res = show_finder.find_show_urls(show, years=[year], api_key=st.session_state.get("tavily_key", ""))
+    except show_finder.ShowFinderError as exc:
+        st.session_state["finder_error"] = str(exc)
+        return
+    except Exception as exc:
+        st.session_state["finder_error"] = f"Unexpected error: {exc.__class__.__name__}: {exc}"
+        return
+    cur = st.session_state.get("finder") or {"show": res["show"], "current": [], "by_year": {},
+                                              "years_with_maps": [], "years_probed": [], "log": []}
+    cur["by_year"][year] = res["by_year"].get(year, [])
+    cur["years_probed"] = sorted(set(cur.get("years_probed", [])) | {year}, reverse=True)
+    cur["years_with_maps"] = sorted({y for y in cur["years_probed"] if cur["by_year"].get(y)}, reverse=True)
+    cur["log"] = (cur.get("log") or []) + res["log"]
+    st.session_state["finder"] = cur
+
+
+def finder_hit_label(hit: dict) -> str:
+    platform = {"mapyourshow": "MapYourShow", "a2z": "A2Z", "expocad": "EXPOCAD", "expofp": "ExpoFP"}.get(
+        hit.get("platform"), "verified listing, unsupported platform")
+    return f"[{platform}] {hit.get('title') or hit['url']}"
+
+
+def render_finder_hits(hits: list[dict], key: str, action_label: str, on_pick, extra_args=()) -> None:
+    """A selectbox of verified hits + one action button; unsupported hits are shown as plain links."""
+    supported = [h for h in hits if h.get("supported")]
+    others = [h for h in hits if not h.get("supported")]
+    if supported:
+        labels = [finder_hit_label(h) for h in supported]
+        idx = st.selectbox("Verified directory URL", range(len(labels)), format_func=lambda i: labels[i],
+                           key=f"{key}_pick", label_visibility="collapsed")
+        chosen = supported[idx]
+        st.caption(chosen["url"])
+        st.button(action_label, key=f"{key}_use", on_click=on_pick, args=tuple(extra_args) + (chosen["url"],),
+                  width="stretch")
+    for h in others:
+        st.markdown(f"- Verified exhibitor listing on a platform this engine cannot extract "
+                    f"(open it by hand): [{h.get('title') or h['url']}]({h['url']})")
+
+
 # =============================================================================
 # Sidebar
 # =============================================================================
@@ -270,10 +358,20 @@ def render_sidebar() -> dict:
         budget = st.number_input("Max Apollo org lookups per run (1 credit each)", min_value=1, max_value=500,
                                  value=DEFAULT_APOLLO_BUDGET, step=5,
                                  help="Apollo Free = 75 credits/month. People search is free.")
+        tavily_secret = ""
+        try:
+            tavily_secret = st.secrets.get("TAVILY_API_KEY", "")
+        except Exception:
+            tavily_secret = ""
+        tavily_key = st.text_input("Tavily API key (optional: enables 'Find it for me')", value=tavily_secret,
+                                   type="password",
+                                   help="Free tier at tavily.com (~1,000 searches/month). Used only to search for and "
+                                        "verify a show's exhibitor-directory URL. Leave blank to skip that feature.")
+        st.session_state["tavily_key"] = (tavily_key or "").strip()
 
         st.divider()
         st.markdown("**Target show**")
-        url = st.text_input("Directory / floor-plan URL (MapYourShow, A2Z, EXPOCAD, ExpoFP)",
+        url = st.text_input("Directory / floor-plan URL (MapYourShow, A2Z, EXPOCAD, ExpoFP)", key="url_box",
                             placeholder="https://ces2026.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm",
                             help="Any page on a mapyourshow.com, a2zinc.net/mya2zevents.com, expocad(web).com, "
                                  "or expofp.com host. MapYourShow is read via its JSON endpoints; the other "
@@ -282,6 +380,7 @@ def render_sidebar() -> dict:
         allow_demo = st.checkbox("Load demo dataset if the URL fails", value=True,
                                  help="20 fictional exhibitors so the UI can be demonstrated offline. "
                                       "Clearly banded as DEMO DATA whenever shown.")
+        render_show_finder()
 
         # Editable show name/year (Task 1: the "+1 year" fix). Re-seeded from the freshly
         # extracted meta only when a NEW extraction lands (its extracted_at stamp changes);
@@ -328,6 +427,57 @@ def render_sidebar() -> dict:
     return {"api_key": api_key, "use_mock": use_mock, "budget": int(budget), "url": (url or "").strip(),
             "allow_demo": allow_demo, "min_sqft": int(min_sqft), "max_sqft": int(max(max_sqft, min_sqft)),
             "run": run}
+
+
+def render_show_finder() -> None:
+    """Sidebar expander: show name -> searched, content-verified directory URLs (current + prior years)."""
+    have_key = bool(st.session_state.get("tavily_key"))
+    finder = st.session_state.get("finder")
+    title = "Find the directory URL for me"
+    if finder:
+        title += f" ({len(finder['current'])} current, {len(finder['years_with_maps'])} prior year(s) verified)"
+    with st.expander(title, expanded=bool(finder) or bool(st.session_state.get("finder_error"))):
+        if not have_key:
+            st.caption("Add a Tavily API key above (or TAVILY_API_KEY in secrets) to search for a show's "
+                       "directory by name. Every hit is content-verified before it is offered.")
+        # Seed from the editable show name once it is known; the user can still overtype it.
+        if not st.session_state.get("finder_show") and st.session_state.get("show_base"):
+            st.session_state["finder_show"] = st.session_state["show_base"]
+        show = st.text_input("Show to find", key="finder_show", placeholder="e.g. NAB Show, SEMA Show, CES",
+                             disabled=not have_key)
+        back = st.number_input("Prior editions to probe", min_value=0, max_value=show_finder.MAX_YEARS_BACK,
+                               value=show_finder.DEFAULT_YEARS_BACK, step=1, disabled=not have_key,
+                               help="Each probed year costs one search + one extract call. Answers 'how many "
+                                    "years of maps exist' from what search can still find AND verify.")
+        if st.button("Search & verify", key="finder_run", disabled=not have_key, width="stretch"):
+            # Prior years are counted back from the show year in play: the sidebar override, else the
+            # year THIS extraction observed, and only with neither does today's calendar year stand in.
+            anchor = st.session_state.get("show_year") or (st.session_state.get("meta") or {}).get("show_year")
+            years = show_finder.years_to_probe(anchor, int(back))
+            with st.spinner("Searching and verifying page content..."):
+                run_show_finder((show or "").strip(), years)
+        if st.session_state.get("finder_error"):
+            st.error(st.session_state["finder_error"])
+        finder = st.session_state.get("finder")
+        if not finder:
+            return
+        st.markdown(f"**{finder['show']}: current edition**")
+        if finder["current"]:
+            render_finder_hits(finder["current"], key="finder_cur", action_label="Use as target URL",
+                               on_pick=use_found_url)
+        else:
+            st.caption("No search result passed content verification for the current edition.")
+        if finder["years_probed"]:
+            st.markdown(show_finder.summarize_years(finder))
+            for y in finder["years_probed"]:
+                hits = finder["by_year"].get(y) or []
+                if hits:
+                    st.markdown(f"**{y}**")
+                    render_finder_hits(hits, key=f"finder_y{y}", action_label=f"Send to a {y} timeline slot",
+                                       on_pick=send_found_to_slot, extra_args=(y,))
+        with st.expander("Finder log"):
+            for line in finder.get("log") or []:
+                st.write(line)
 
 
 # =============================================================================
@@ -515,6 +665,11 @@ def source_banner(meta: dict) -> None:
     note = f"{meta['total']} exhibitors, {meta['sized']} with floor-plan geometry, extracted {meta['extracted_at']}"
     if meta.get("hall_errors"):
         note += f", {meta['hall_errors']} hall(s) failed to load"
+    if meta.get("low_confidence"):
+        # Browser-platform rows whose footprint came through a fuzzy field-name match: real numbers
+        # read from the payload, but from a column the normaliser had to guess the meaning of.
+        note += (f", {meta['low_confidence']} sized via fuzzy field matches (size_source ends in -fuzzy; "
+                 f"spot-check against the live floor plan)")
     st.markdown(f"<div class='ax-muted'>{note}</div>", unsafe_allow_html=True)
 
 
@@ -583,6 +738,9 @@ BASE_COLUMN_CONFIG = {
     "est_value": st.column_config.NumberColumn("Est. value", format="$%d", width="small"),
     "trigger_badge": st.column_config.TextColumn("Trigger", width="medium"),
     "apollo_source": st.column_config.TextColumn("Source", width="small"),
+    "size_source": st.column_config.TextColumn("Size source", width="small",
+                                               help="floorplan / <platform>-json = read cleanly; -fuzzy = read through a "
+                                                    "fuzzy field-name match; unknown = no footprint in the data (0 sq ft)."),
 }
 
 
@@ -617,7 +775,7 @@ def tab_scanner(params: dict, all_df: pd.DataFrame, targets: pd.DataFrame, meta:
                        key="grid_oversized")
 
     with st.expander(f"Full directory ({len(all_df):,} exhibitors, all sizes)"):
-        show_table(all_df, cols, int(all_df["sqft"].max() or 1), key="grid_all", height=420)
+        show_table(all_df, cols + ["size_source"], int(all_df["sqft"].max() or 1), key="grid_all", height=420)
         with_size = int((all_df["sqft"] > 0).sum())
         st.caption(f"{with_size:,} of {len(all_df):,} exhibitors have floor-plan geometry. "
                    f"Exhibitors without geometry show 0 sq ft and never enter the target list.")
@@ -642,18 +800,21 @@ def render_timeline_slot(slot: dict) -> None:
     sid = slot["id"]
     with st.container(border=True):
         c1, c2, c3 = st.columns([1, 2, 1])
-        c1.number_input("Year", min_value=2015, max_value=2035, step=1,
-                        value=slot["year"] or 2025, key=f"slot_year_{sid}")
-        mode = c2.radio("Source", ["CSV upload", "MapYourShow URL"], key=f"slot_mode_{sid}", horizontal=True)
+        # A default `value` only when nothing (e.g. the finder's send-to-slot) has seeded the key.
+        year_kw = {} if f"slot_year_{sid}" in st.session_state else {"value": slot["year"] or 2025}
+        c1.number_input("Year", min_value=2015, max_value=2035, step=1, key=f"slot_year_{sid}", **year_kw)
+        mode = c2.radio("Source", [SLOT_MODE_CSV, SLOT_MODE_URL], key=f"slot_mode_{sid}", horizontal=True)
         c3.markdown("&nbsp;", unsafe_allow_html=True)   # align the Remove button with the row above
         c3.button("Remove slot", key=f"slot_remove_{sid}", on_click=remove_timeline_slot, args=(sid,),
                   width="stretch")
-        if mode == "CSV upload":
+        if mode == SLOT_MODE_CSV:
             st.file_uploader("Prior-year CSV (this app's export, or any file with a name + sq-ft column)",
                              type=["csv"], key=f"slot_csv_{sid}")
         else:
-            st.text_input("MapYourShow directory URL for that year's show", key=f"slot_url_{sid}",
+            st.text_input("Directory URL for that year's show (MapYourShow, A2Z, EXPOCAD, ExpoFP)",
+                          key=f"slot_url_{sid}",
                           placeholder="https://nab26.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm")
+            render_slot_finder(slot)
         lc1, lc2 = st.columns([1, 3])
         lc1.button("Load", key=f"slot_load_{sid}", type="primary", on_click=load_timeline_slot, args=(sid,))
         if slot.get("error"):
@@ -664,11 +825,40 @@ def render_timeline_slot(slot: dict) -> None:
             lc2.caption("Not loaded yet.")
 
 
+def render_slot_finder(slot: dict) -> None:
+    """Inside a URL-mode timeline slot: offer already-verified URLs for this slot's year, or probe it."""
+    sid = slot["id"]
+    year = st.session_state.get(f"slot_year_{sid}") or slot.get("year")
+    finder = st.session_state.get("finder") or {}
+    hits = (finder.get("by_year") or {}).get(year) or []
+    if hits:
+        st.caption(f"Verified by the finder for {year}:")
+        render_finder_hits(hits, key=f"slot_finder_{sid}", action_label=f"Use this URL for {year}",
+                           on_pick=send_found_to_slot, extra_args=(year,))
+        return
+    show = (st.session_state.get("finder_show") or st.session_state.get("show_base") or "").strip()
+    if not st.session_state.get("tavily_key"):
+        st.caption("Tip: add a Tavily API key in the sidebar and the engine can search for this year's "
+                   "directory URL for you (content-verified before it is offered).")
+        return
+    if not show:
+        st.caption("Set the show name in the sidebar to search for this year's directory.")
+        return
+    if year in (finder.get("years_probed") or []):
+        st.caption(f"The finder probed {year} for {finder.get('show')} and found no verifiable directory. "
+                   f"Use your own saved CSV/URL for that year.")
+    if st.button(f"Find the {year} directory for {show}", key=f"slot_find_{sid}"):
+        with st.spinner(f"Searching for {show} {year} and verifying page content..."):
+            run_show_finder_year(show, int(year))
+        st.rerun()
+
+
 def tab_timeline(params: dict, targets: pd.DataFrame) -> None:
     st.markdown("#### Multi-year show timeline")
     st.caption(md(
         "Add prior years as a CSV (this app's own export, or any file with a name and sq-ft column) or a "
-        "MapYourShow directory URL for that year's show -- up to 6 years total. With three or more years on "
+        "directory URL for that year's show (any supported platform; with a Tavily key the engine can search "
+        "for and verify prior-year URLs for you) -- up to 6 years total. With three or more years on "
         "file the engine sees the SHAPE of a company's booth history, not just one delta: a booth that grew "
         "to a peak and pulled back (small -> large -> medium) is flagged PEAK RETREAT, likely shopping for a "
         "new exhibit partner to make a splash again. A jump from under 200 to 400+ sq ft is still flagged "

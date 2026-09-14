@@ -20,14 +20,32 @@ def run(at: AppTest) -> AppTest:
     return at
 
 
+# Sidebar widgets are looked up by LABEL, not position: new inputs (Tavily key, the finder
+# expander) shift the indices and positional lookups would silently target the wrong widget.
+def sidebar_text_input(at: AppTest, label_start: str):
+    return [t for t in at.sidebar.text_input if t.label.startswith(label_start)][0]
+
+
+def sidebar_number_input(at: AppTest, label: str):
+    return [n for n in at.sidebar.number_input if n.label == label][0]
+
+
+def sidebar_checkbox(at: AppTest, label_start: str):
+    return [c for c in at.sidebar.checkbox if c.label.startswith(label_start)][0]
+
+
 at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=60)
 run(at)
 assert "How this works" in " ".join(m.value for m in at.markdown), "empty state missing"
-assert at.sidebar.button[0].label == "Run Extraction"
-assert at.sidebar.number_input[1].value == 400 and at.sidebar.number_input[2].value == 3000
+def run_button(at: AppTest):
+    return [b for b in at.sidebar.button if b.label == "Run Extraction"][0]
+
+
+assert run_button(at)
+assert sidebar_number_input(at, "Min booth sq ft").value == 400 and sidebar_number_input(at, "Max booth sq ft").value == 3000
 
 # 1. Run extraction with no URL -> demo dataset (allowed by default)
-at.sidebar.button[0].click()
+run_button(at).click()
 run(at)
 assert at.session_state["exhibitors"] is not None and len(at.session_state["exhibitors"]) == 20
 metrics = {m.label: m.value for m in at.metric}
@@ -41,12 +59,12 @@ assert any("DEMO DATA" in w.value for w in at.warning), "demo banner missing"
 assert len(at.tabs) == 1 and len(at.tabs[0].children) >= 5 or True
 
 # 2. Sidebar filter change re-filters live
-at.sidebar.number_input[1].set_value(900)
+sidebar_number_input(at, "Min booth sq ft").set_value(900)
 run(at)
 metrics = {m.label: m.value for m in at.metric}
 expected = int(((demo_targets["sqft"] >= 900) & (demo_targets["sqft"] <= 3000)).sum())
 assert metrics["Target Islands"] == str(expected), metrics
-at.sidebar.number_input[1].set_value(400)
+sidebar_number_input(at, "Min booth sq ft").set_value(400)
 run(at)
 
 # 3. Task 2: multi-year timeline. First exercise the real "+ Add prior year" UI and confirm a
@@ -147,12 +165,84 @@ assert at.session_state["show_year"] is None, at.session_state["show_year"]
 assert any("2027" in m.value for m in at.markdown), "fallback to extracted show year missing"
 
 # 8. Disable demo fallback + bad URL -> error state, no crash
-at.sidebar.checkbox[1].set_value(False)
-at.sidebar.text_input[1].set_value("https://notreal.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm")
-at.sidebar.button[0].click()
+sidebar_checkbox(at, "Load demo dataset").set_value(False)
+sidebar_text_input(at, "Directory / floor-plan URL").set_value("https://notreal.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm")
+run_button(at).click()
 run(at)
 assert at.session_state["exhibitors"] is not None  # previous data kept... or cleared? check log
 print("log after failed live run:", at.session_state["extract_log"])
 assert any("failed" in line.lower() for line in at.session_state["extract_log"])
+
+
+# 9. "Find it for me" (show_finder). Without a Tavily key the feature is present but disabled with
+#    a hint -- never a crash. With a key, the lookup is MOCKED (api.tavily.com is unreachable from
+#    the build container) and a picked result must land in the URL field / a timeline slot.
+import show_finder  # noqa: E402
+
+finder_btn = [b for b in at.sidebar.button if b.label == "Search & verify"]
+assert finder_btn and finder_btn[0].disabled, "finder button should exist but be disabled without a key"
+assert any("Tavily API key" in c.value for c in at.sidebar.caption), "missing no-key hint"
+assert at.session_state["finder"] is None
+
+sidebar_text_input(at, "Tavily API key").set_value("test-key")
+run(at)
+finder_btn = [b for b in at.sidebar.button if b.label == "Search & verify"][0]
+assert not finder_btn.disabled
+
+calls = []
+
+
+def fake_find(show, years=None, client=None, api_key="", log=None):
+    calls.append((show, list(years or []), api_key))
+    good = "https://nab26.mapyourshow.com/8_0/explore/exhview.cfm"
+    return {"show": show, "years_probed": list(years or []), "years_with_maps": [2026], "log": ["mocked"],
+            "current": [{"url": good, "title": "NAB Show 2026 Exhibitors", "platform": "mapyourshow",
+                         "year": None, "url_year": 2026, "preview": "", "supported": True}],
+            "by_year": {2026: [{"url": "https://user-1.cld.bz/NAB-2026-Show-Directory", "title": "NAB 2026 flipbook",
+                                "platform": None, "year": 2026, "url_year": 2026, "preview": "", "supported": False},
+                               {"url": "https://nab26.mapyourshow.com/8_0/explore/exhview.cfm", "title": "NAB 2026",
+                                "platform": "mapyourshow", "year": 2026, "url_year": 2026, "preview": "",
+                                "supported": True}],
+                        2025: []}}
+
+
+orig_find = show_finder.find_show_urls
+show_finder.find_show_urls = fake_find
+try:
+    sidebar_text_input(at, "Show to find").set_value("NAB Show")
+    sidebar_number_input(at, "Prior editions to probe").set_value(2)
+    [b for b in at.sidebar.button if b.label == "Search & verify"][0].click()
+    run(at)
+    assert calls and calls[0][0] == "NAB Show" and calls[0][2] == "test-key", calls
+    assert calls[0][1] == [2026, 2025], calls   # anchored on the year the demo extraction observed (2027), not today
+    assert at.session_state["finder"]["show"] == "NAB Show"
+    assert any("1 of 2 probed" in m.value for m in at.sidebar.markdown), [m.value for m in at.sidebar.markdown]
+    # an UNSUPPORTED verified hit is shown as a hand-open link, never as a selectable URL
+    assert any("cannot extract" in m.value and "cld.bz" in m.value for m in at.sidebar.markdown)
+    use_btn = [b for b in at.sidebar.button if b.label == "Use as target URL"][0]
+    use_btn.click()
+    run(at)
+    assert at.session_state["url_box"] == "https://nab26.mapyourshow.com/8_0/explore/exhview.cfm", at.session_state["url_box"]
+    assert sidebar_text_input(at, "Directory / floor-plan URL").value.endswith("exhview.cfm")
+    # send the 2026 hit to a timeline slot: creates the slot, pre-fills year, mode and URL
+    n_slots = len(at.session_state["timeline_slots"])
+    [b for b in at.sidebar.button if b.label == "Send to a 2026 timeline slot"][0].click()
+    run(at)
+    slots = at.session_state["timeline_slots"]
+    assert len(slots) == n_slots + 1, slots
+    sid = slots[-1]["id"]
+    assert at.session_state[f"slot_url_{sid}"].endswith("exhview.cfm") and at.session_state[f"slot_year_{sid}"] == 2026
+    assert at.session_state[f"slot_mode_{sid}"] == "Directory URL"
+    print("finder UI:", at.session_state["url_box"], "-> slot", sid)
+
+    # a lookup failure is an inline error, not an exception
+    def failing_find(*a, **kw):
+        raise show_finder.ShowFinderError("Tavily lookup failed: ConnectionError: proxy 403")
+    show_finder.find_show_urls = failing_find
+    [b for b in at.sidebar.button if b.label == "Search & verify"][0].click()
+    run(at)
+    assert any("Tavily lookup failed" in e.value for e in at.sidebar.error), [e.value for e in at.sidebar.error]
+finally:
+    show_finder.find_show_urls = orig_find
 
 print("\nAPP TEST PASSED")
