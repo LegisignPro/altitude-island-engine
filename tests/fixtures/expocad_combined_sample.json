@@ -1,0 +1,97 @@
+[
+ {
+  "url": "https://swe.example.expocad.com/Events/we26/api/BoothData.ashx?page=1",
+  "status": 200,
+  "json": {
+   "status": "ok",
+   "generatedAt": "2026-09-01T10:00:00Z",
+   "page": 1,
+   "pageCount": 1,
+   "data": {
+    "bths": [
+     {
+      "bthId": 1207,
+      "bthNo": "1207",
+      "exhName": "Nova Widgets",
+      "exhWeb": "novawidgets.com",
+      "sqFt": "400",
+      "hallCd": "A",
+      "fillColor": "#ffcc00",
+      "sold": true,
+      "x": 10,
+      "y": 20,
+      "rot": 0
+     },
+     {
+      "bthId": 1311,
+      "bthNo": "1311",
+      "exhName": "Quantum Rigging",
+      "exhWeb": "",
+      "sqFt": 900,
+      "hallCd": "A",
+      "fillColor": "#ffcc00",
+      "sold": true,
+      "x": 50,
+      "y": 20,
+      "rot": 0
+     },
+     {
+      "bthId": 1500,
+      "bthNo": "1500",
+      "exhName": "Pavilion of Nations",
+      "exhWeb": "",
+      "sqFt": 1200,
+      "hallCd": "B",
+      "fillColor": "#cccccc",
+      "sold": true,
+      "x": 90,
+      "y": 20,
+      "rot": 0
+     },
+     {
+      "bthId": 1601,
+      "bthNo": "1601",
+      "exhName": "Helix Lighting",
+      "exhWeb": "helixlighting.com",
+      "sqFt": null,
+      "hallCd": "B",
+      "fillColor": "#ffcc00",
+      "sold": true,
+      "x": 120,
+      "y": 20,
+      "rot": 0
+     },
+     {
+      "bthId": 1700,
+      "bthNo": "1700",
+      "exhName": "",
+      "exhWeb": "",
+      "sqFt": 100,
+      "hallCd": "B",
+      "fillColor": "#eeeeee",
+      "sold": false,
+      "x": 150,
+      "y": 20,
+      "rot": 0
+     }
+    ]
+   }
+  }
+ },
+ {
+  "url": "https://swe.example.expocad.com/Events/we26/api/Legend.ashx",
+  "status": 200,
+  "json": {
+   "legend": [
+    {
+     "label": "Sold",
+     "color": "#ffcc00"
+    },
+    {
+     "label": "Available",
+     "color": "#eeeeee"
+    }
+   ]
+  }
+ }
+]

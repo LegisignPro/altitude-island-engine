@@ -1,0 +1,57 @@
+[
+ {
+  "url": "https://example.expocad.com/Events/xx26/api/floorplan.json",
+  "status": 200,
+  "json": {
+   "Halls": [
+    {
+     "HallName": "North Hall",
+     "Booths": [
+      {
+       "BoothNumber": "301",
+       "Dimensions": {
+        "Width": 20,
+        "Depth": 30
+       },
+       "Exhibitor": {
+        "Name": "Orbit Optics",
+        "Website": "https://orbitoptics.com",
+        "Id": 9
+       }
+      },
+      {
+       "BoothNumber": "305",
+       "Size": "10x20",
+       "Exhibitor": {
+        "Name": "Cobalt Audio",
+        "Website": "cobaltaudio.com",
+        "Id": 11
+       }
+      },
+      {
+       "BoothNumber": "310",
+       "Area": "North Hall",
+       "Exhibitor": {
+        "Name": "Mesa Robotics",
+        "Website": "",
+        "Id": 12
+       }
+      },
+      {
+       "BoothNumber": "320",
+       "Dimensions": {
+        "Width": 10,
+        "Depth": 10
+       },
+       "Exhibitor": {
+        "Name": "Department of Commerce",
+        "Website": "",
+        "Id": 13
+       }
+      }
+     ]
+    }
+   ]
+  }
+ }
+]

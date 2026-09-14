@@ -1,0 +1,20 @@
+[
+ {
+  "url": "https://example.expocad.com/Events/yy26/api/Exhibitors.json",
+  "status": 200,
+  "json": [
+   {
+    "CompanyName": "Solaris Media",
+    "Description": "Broadcast gear",
+    "Category": "Video",
+    "Featured": true
+   },
+   {
+    "CompanyName": "Tundra Networks",
+    "Description": "Fibre",
+    "Category": "IT",
+    "Featured": false
+   }
+  ]
+ }
+]

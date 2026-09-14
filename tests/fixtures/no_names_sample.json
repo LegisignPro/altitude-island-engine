@@ -1,0 +1,24 @@
+[
+ {
+  "url": "https://example.expocad.com/Events/zz26/api/shapes.json",
+  "status": 200,
+  "json": {
+   "booths": [
+    {
+     "x": 1,
+     "y": 2,
+     "w": 10,
+     "h": 10,
+     "boothId": "A1"
+    },
+    {
+     "x": 5,
+     "y": 2,
+     "w": 10,
+     "h": 20,
+     "boothId": "A2"
+    }
+   ]
+  }
+ }
+]
