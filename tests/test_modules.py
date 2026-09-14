@@ -14,6 +14,7 @@ import apollo  # noqa: E402
 import delta_engine  # noqa: E402
 import freight  # noqa: E402
 import pitch_generator as pg  # noqa: E402
+import platforms  # noqa: E402
 import scraper  # noqa: E402
 
 PORT = 8765
@@ -240,6 +241,22 @@ def test_apollo_mock_and_pitch(delta_df: pd.DataFrame):
     print(out[["exhibitor_name", "sqft", "yoy_status", "trigger_badge"]].to_string())
 
 
+def test_platform_detection():
+    # Host-based matches, including one platform on each vendor domain.
+    assert platforms.platform_for("https://ole.a2zinc.net/OLEWest2025/Public/eventmap.aspx?ID=54823") == "a2z"
+    assert platforms.platform_for(
+        "https://s36.a2zinc.net/clients/FSPA/opss2026/Public/EventMap.aspx?shmode=E&ID=3007") == "a2z"
+    assert platforms.platform_for("https://swe.expocad.com/Events/we26/index.html") == "expocad"
+    assert platforms.platform_for("https://show.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm") == "mapyourshow"
+    assert platforms.platform_for("https://demo.expofp.com/somemap") == "expofp"
+    # White-labelled A2Z on a show's own domain (real example from Woz: a2z.aafp.org) -- caught by
+    # the /Public/EventMap.aspx path signature since the host alone gives no hint.
+    assert platforms.platform_for("https://a2z.aafp.org/future2026/Public/eventmap.aspx?shMode=E") == "a2z"
+    # A URL with neither a known host nor a known path stays unrecognised, not a guess.
+    assert platforms.platform_for("https://example.com/some/random/page") is None
+    print("platform detection OK")
+
+
 if __name__ == "__main__":
     proc = start_server()
     try:
@@ -251,6 +268,7 @@ if __name__ == "__main__":
         test_build_trajectories()
         test_freight()
         test_apollo_mock_and_pitch(delta_df)
+        test_platform_detection()
         print("\nALL MODULE TESTS PASSED")
     finally:
         proc.terminate()
