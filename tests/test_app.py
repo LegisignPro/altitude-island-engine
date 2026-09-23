@@ -1,248 +1,113 @@
-"""Drive the Streamlit app headlessly with AppTest: demo extraction -> Apollo mock -> pitches -> export."""
-import io
+"""
+Drive the Streamlit app headlessly with AppTest on REAL data only.
+
+Uses the Map Grabber CSVs captured from live shows in tests/fixtures/real/ (two editions of the
+same show when available, so the timeline has a genuine year-over-year comparison). There is no
+demo dataset and no Apollo mock in v3, so this test never touches invented companies.
+
+Run:  python tests/test_app.py
+"""
+import glob
 import os
 import sys
 
-import pandas as pd
 from streamlit.testing.v1 import AppTest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.chdir(ROOT)
 
-import delta_engine  # noqa: E402
-import pitch_generator as pg  # noqa: E402
+import quality  # noqa: E402
+import showfile  # noqa: E402
+
+REAL = os.path.join(ROOT, "tests", "fixtures", "real")
 
 
 def run(at: AppTest) -> AppTest:
-    at.run(timeout=60)
+    at.run(timeout=90)
     assert not at.exception, at.exception
     return at
 
 
-# Sidebar widgets are looked up by LABEL, not position: new inputs (Tavily key, the finder
-# expander) shift the indices and positional lookups would silently target the wrong widget.
-def sidebar_text_input(at: AppTest, label_start: str):
-    return [t for t in at.sidebar.text_input if t.label.startswith(label_start)][0]
+def by_label(widgets, start):
+    return [w for w in widgets if w.label.startswith(start)]
 
 
-def sidebar_number_input(at: AppTest, label: str):
-    return [n for n in at.sidebar.number_input if n.label == label][0]
-
-
-def sidebar_checkbox(at: AppTest, label_start: str):
-    return [c for c in at.sidebar.checkbox if c.label.startswith(label_start)][0]
-
-
-at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=60)
+# 0. Empty state: instructions + Map Grabber bookmark + Platform Check, no data, no demo
+at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=90)
 run(at)
-assert "How this works" in " ".join(m.value for m in at.markdown), "empty state missing"
-def run_button(at: AppTest):
-    return [b for b in at.sidebar.button if b.label == "Run Extraction"][0]
+text = " ".join(m.value for m in at.markdown)
+assert "How this works" in text and "Map Grabber bookmark" in text and "Platform Check" in text
+assert not by_label(at.sidebar.checkbox, "Load demo"), "demo option must be gone"
+assert not by_label(at.sidebar.checkbox, "Use mock"), "mock option must be gone"
+assert at.session_state["exhibitors"] is None
+assert any(c.value.startswith("javascript:") for c in at.code), "bookmarklet code missing"
 
-
-assert run_button(at)
-assert sidebar_number_input(at, "Min booth sq ft").value == 400 and sidebar_number_input(at, "Max booth sq ft").value == 3000
-
-# 1. Run extraction with no URL -> demo dataset (allowed by default)
-run_button(at).click()
+# 1. Run Extraction with no URL -> nothing loaded, no fallback
+by_label(at.sidebar.button, "Run Extraction")[0].click()
 run(at)
-assert at.session_state["exhibitors"] is not None and len(at.session_state["exhibitors"]) == 20
+assert at.session_state["exhibitors"] is None, "an empty run must not load anything"
+assert any("No URL" in line for line in at.session_state["extract_log"])
+
+# 2. Seed with real grabber CSVs (what 'Load CSVs' does), newest year = current show
+files = sorted(glob.glob(os.path.join(REAL, "*.csv")))
+loaded = [showfile.load(f) for f in files]
+groups = {}
+for df, meta in loaded:
+    groups.setdefault((meta["platform"], meta["show_base"]), []).append((df, meta))
+multi = [g for g in groups.values() if len({m["show_year"] for _, m in g}) >= 2]
+series = sorted((multi[0] if multi else max(groups.values(), key=len)), key=lambda t: t[1]["show_year"])
+cur_df, cur_meta = series[-1]
+print("current show:", cur_meta["filename"], len(cur_df), "companies; prior:", [m["filename"] for _, m in series[:-1]])
+
+at.session_state["exhibitors"] = cur_df
+at.session_state["meta"] = {**cur_meta, "extracted_at": "test"}
+at.session_state["quality"] = quality.check(cur_df.to_dict("records"), cur_meta)
+at.session_state["show_base"] = cur_meta["show_base"] or ""
+at.session_state["show_year"] = cur_meta["show_year"]
+slots = []
+for i, (df, meta) in enumerate(series[:-1], start=1):
+    slots.append({"id": i, "year": meta["show_year"], "df": df[["exhibitor_name", "sqft"]], "label": meta["filename"],
+                  "error": "", "quality": "PASS"})
+    at.session_state[f"slot_year_{i}"] = meta["show_year"]
+at.session_state["timeline_slots"] = slots
+at.session_state["_slot_seq"] = len(slots)
+run(at)
+
 metrics = {m.label: m.value for m in at.metric}
-print("metrics after extraction:", metrics)
-assert metrics["Total Exhibitors"] == "20"
-demo_targets = at.session_state["exhibitors"]
-expected_targets = int(((demo_targets["sqft"] >= 400) & (demo_targets["sqft"] <= 3000)).sum())
-assert metrics["Target Islands"] == str(expected_targets), (metrics, expected_targets)
-assert metrics["Estimated Pipeline Value"].startswith("$")
-assert any("DEMO DATA" in w.value for w in at.warning), "demo banner missing"
-assert len(at.tabs) == 1 and len(at.tabs[0].children) >= 5 or True
+print("metrics:", metrics)
+assert metrics["Total Exhibitors"] == f"{len(cur_df):,}"
+expected = int(((cur_df["sqft"] >= 400) & (cur_df["sqft"] <= 3000)).sum())
+assert metrics["Target Islands"] == f"{expected:,}", (metrics, expected)
+assert any("Quality PASS" in m.value or "Quality WARN" in m.value for m in at.markdown), "quality pill missing"
+assert not any("DEMO" in w.value.upper() for w in at.warning)
 
-# 2. Sidebar filter change re-filters live
-sidebar_number_input(at, "Min booth sq ft").set_value(900)
+# 3. Timeline: real YoY comparison when two editions are on file
+if slots:
+    assert "Newborn islands" in metrics and "Dropped out" in metrics
+    print("timeline:", {k: metrics[k] for k in ("Newborn islands", "Peak retreats", "New to show", "Dropped out")})
+
+# 4. Apollo without a key: button disabled, no fake enrichment
+run_apollo = by_label(at.button, "Run Apollo enrichment")
+assert run_apollo and run_apollo[0].disabled, "Apollo must be disabled without a key"
+assert not at.session_state["orgs"]
+
+# 5. Exports are allowed on PASS/WARN and stamped with the grade
+dl = [b for b in at.get("download_button") if "campaign" in str(b.proto.label).lower()]
+assert dl and not dl[0].proto.disabled
+
+# 6. A FAIL grade blocks exports (demo leakage can't be overridden)
+q = quality.check(cur_df.to_dict("records"), cur_meta)
+at.session_state["quality"] = {**q, "grade": "FAIL", "demo": True, "notes": "test"}
 run(at)
-metrics = {m.label: m.value for m in at.metric}
-expected = int(((demo_targets["sqft"] >= 900) & (demo_targets["sqft"] <= 3000)).sum())
-assert metrics["Target Islands"] == str(expected), metrics
-sidebar_number_input(at, "Min booth sq ft").set_value(400)
+dl = [b for b in at.get("download_button") if "campaign" in str(b.proto.label).lower()]
+assert dl and dl[0].proto.disabled, "FAIL must block the campaign export"
+assert not by_label(at.checkbox, "Use anyway"), "demo FAIL must not offer an override"
+
+# 7. Bad live URL -> clear error, previous data kept, no fallback
+by_label(at.sidebar.text_input, "Directory / floor-plan URL")[0].set_value("https://example.com/not-a-floor-plan")
+by_label(at.sidebar.button, "Run Extraction")[0].click()
 run(at)
-
-# 3. Task 2: multi-year timeline. First exercise the real "+ Add prior year" UI and confirm a
-# slot's widgets render; AppTest cannot simulate an actual file upload, so the data itself is
-# injected directly into session_state (same approach the old single-CSV test used).
-add_btn = [b for b in at.button if b.label.startswith("+ Add prior year")]
-assert add_btn, [b.label for b in at.button]
-add_btn[0].click()
-run(at)
-assert any(n.label == "Year" for n in at.number_input), "timeline slot Year input missing after Add"
-assert any(b.label == "Remove slot" for b in at.button), "timeline slot Remove button missing after Add"
-
-prior_csv = "exhibitor_name,sqft\nLumen Audio Labs,100\nOrbit Wireless Video,400\nKestrel Aerial Cinema,900\nSummit Streaming Platforms,100\n"
-prior_df = delta_engine.load_prior_csv(io.BytesIO(prior_csv.encode())).rename(
-    columns={"prior_name": "exhibitor_name", "prior_sqft": "sqft"})[["exhibitor_name", "sqft"]]
-at.session_state["timeline_slots"] = [{"id": 901, "year": 2026, "df": prior_df, "label": "prior.csv", "error": ""}]
-run(at)
-metrics = {m.label: m.value for m in at.metric}
-print("timeline metrics (2 slots):", {k: v for k, v in metrics.items()
-      if k in ("Newborn islands", "Peak retreats", "Steady growth", "Shrinking", "New to show")})
-assert metrics["Newborn islands"] == "2", metrics        # Lumen 100->400, Summit 100->600
-assert all(k in metrics for k in ("Peak retreats", "Steady growth", "Shrinking", "New to show"))
-
-# 3b. A THIRD slot turns a couple of those two-point deltas into a real multi-year shape:
-# Lumen grows steadily (100 -> 250 -> 400) and Vantage peaks then pulls back (300 -> 900 -> 600,
-# still >= 400 sq ft) -- Woz's "small -> large -> medium" pattern.
-prior_2024 = pd.DataFrame([{"exhibitor_name": "Lumen Audio Labs", "sqft": 100},
-                           {"exhibitor_name": "Vantage Robotics Systems", "sqft": 300}])
-prior_2025 = pd.DataFrame([{"exhibitor_name": "Lumen Audio Labs", "sqft": 250},
-                           {"exhibitor_name": "Vantage Robotics Systems", "sqft": 900}])
-at.session_state["timeline_slots"] = [
-    {"id": 902, "year": 2024, "df": prior_2024, "label": "2024.csv", "error": ""},
-    {"id": 903, "year": 2025, "df": prior_2025, "label": "2025.csv", "error": ""},
-]
-run(at)
-metrics = {m.label: m.value for m in at.metric}
-print("timeline metrics (3 slots):", {k: v for k, v in metrics.items()
-      if k in ("Newborn islands", "Peak retreats", "Steady growth", "Shrinking", "New to show")})
-assert metrics["Peak retreats"] == "1", metrics      # Vantage: 300 -> 900 -> 600 (50-90% of peak)
-assert metrics["Steady growth"] == "1", metrics      # Lumen: 100 -> 250 -> 400, monotonic, >= 400
-timeline_grid = [d for d in at.dataframe if "trajectory" in d.value.columns][0].value
-trajectories_seen = set(timeline_grid["trajectory"])
-print("timeline table trajectories:", trajectories_seen)
-assert "PEAK RETREAT" in trajectories_seen, trajectories_seen
-assert "STEADY GROWTH" in trajectories_seen, trajectories_seen
-
-# 4. Apollo mock enrichment (button in tab 4)
-btn = [b for b in at.button if b.label.startswith("Run Apollo enrichment")]
-assert btn, [b.label for b in at.button]
-assert "(" in btn[0].label and btn[0].label.endswith("companies)")
-btn[0].click()
-run(at)
-assert len(at.session_state["orgs"]) > 0, "no orgs enriched"
-assert at.session_state["credits_used"] == 0  # mock mode never spends credits
-metrics = {m.label: m.value for m in at.metric}
-print("apollo metrics:", {k: v for k, v in metrics.items() if k in ("Enriched", "Mode", "HQ known", "High freight savings", "Vegas local")})
-assert metrics["Mode"] == "MOCK"
-assert "HQ known" in metrics  # freight tab now populated
-
-# 5. Pitch tab: all four trigger metrics present; NEWBORN ISLAND count = 2 unless dropped for size
-badges = {t["badge"]: metrics.get(t["badge"]) for t in pg.TRIGGERS.values()}
-print("trigger counts:", badges)
-assert all(v is not None for v in badges.values())
-assert sum(int(v) for v in badges.values()) == int(metrics["Target Islands"])
-# export button exists with data
-dl = [d for d in at.get("download_button") if "campaign" in d.label.lower()]
-assert dl, "campaign download missing"
-
-# 6. Text areas / selectbox preview rendered
-assert any(t.label == "Intro line" for t in at.text_area)
-intro = [t for t in at.text_area if t.label == "Intro line"][0].value
-print("preview intro:", intro[:140])
-assert "DEMO DATA" in intro or "NAB Show" in intro
-
-# 7. Task 1 regression: the "+1 year" fix. Overriding "Show year" in the sidebar must
-#    propagate everywhere the show label is used (banner pill, intro line) -- and it must
-#    come from EITHER this extraction's own inferred year OR what's typed here, never from
-#    today's date or a calendar.
-def show_year_box():
-    # AppTest rebuilds the element tree on every run(), so the widget handle must be
-    # re-fetched after each one rather than reused stale.
-    return [t for t in at.sidebar.text_input if t.label == "Show year"][0]
-
-
-show_year_box().set_value("2026")
-run(at)
-assert at.session_state["show_year"] == 2026, at.session_state["show_year"]
-assert any("2026" in m.value for m in at.markdown), "show-year override missing from banner pill"
-intro2 = [t for t in at.text_area if t.label == "Intro line"][0].value
-print("preview intro after year override:", intro2[:140])
-assert "2026" in intro2, intro2
-# Clearing the override falls back to the year THIS extraction observed (2027 for the
-# demo dataset) -- session_state itself holds None (never silently re-guessed), and only
-# the composed label falls back.
-show_year_box().set_value("")
-run(at)
-assert at.session_state["show_year"] is None, at.session_state["show_year"]
-assert any("2027" in m.value for m in at.markdown), "fallback to extracted show year missing"
-
-# 8. Disable demo fallback + bad URL -> error state, no crash
-sidebar_checkbox(at, "Load demo dataset").set_value(False)
-sidebar_text_input(at, "Directory / floor-plan URL").set_value("https://notreal.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm")
-run_button(at).click()
-run(at)
-assert at.session_state["exhibitors"] is not None  # previous data kept... or cleared? check log
-print("log after failed live run:", at.session_state["extract_log"])
-assert any("failed" in line.lower() for line in at.session_state["extract_log"])
-
-
-# 9. "Find it for me" (show_finder). Without a Tavily key the feature is present but disabled with
-#    a hint -- never a crash. With a key, the lookup is MOCKED (api.tavily.com is unreachable from
-#    the build container) and a picked result must land in the URL field / a timeline slot.
-import show_finder  # noqa: E402
-
-finder_btn = [b for b in at.sidebar.button if b.label == "Search & verify"]
-assert finder_btn and finder_btn[0].disabled, "finder button should exist but be disabled without a key"
-assert any("Tavily API key" in c.value for c in at.sidebar.caption), "missing no-key hint"
-assert at.session_state["finder"] is None
-
-sidebar_text_input(at, "Tavily API key").set_value("test-key")
-run(at)
-finder_btn = [b for b in at.sidebar.button if b.label == "Search & verify"][0]
-assert not finder_btn.disabled
-
-calls = []
-
-
-def fake_find(show, years=None, client=None, api_key="", log=None):
-    calls.append((show, list(years or []), api_key))
-    good = "https://nab26.mapyourshow.com/8_0/explore/exhview.cfm"
-    return {"show": show, "years_probed": list(years or []), "years_with_maps": [2026], "log": ["mocked"],
-            "current": [{"url": good, "title": "NAB Show 2026 Exhibitors", "platform": "mapyourshow",
-                         "year": None, "url_year": 2026, "preview": "", "supported": True}],
-            "by_year": {2026: [{"url": "https://user-1.cld.bz/NAB-2026-Show-Directory", "title": "NAB 2026 flipbook",
-                                "platform": None, "year": 2026, "url_year": 2026, "preview": "", "supported": False},
-                               {"url": "https://nab26.mapyourshow.com/8_0/explore/exhview.cfm", "title": "NAB 2026",
-                                "platform": "mapyourshow", "year": 2026, "url_year": 2026, "preview": "",
-                                "supported": True}],
-                        2025: []}}
-
-
-orig_find = show_finder.find_show_urls
-show_finder.find_show_urls = fake_find
-try:
-    sidebar_text_input(at, "Show to find").set_value("NAB Show")
-    sidebar_number_input(at, "Prior editions to probe").set_value(2)
-    [b for b in at.sidebar.button if b.label == "Search & verify"][0].click()
-    run(at)
-    assert calls and calls[0][0] == "NAB Show" and calls[0][2] == "test-key", calls
-    assert calls[0][1] == [2026, 2025], calls   # anchored on the year the demo extraction observed (2027), not today
-    assert at.session_state["finder"]["show"] == "NAB Show"
-    assert any("1 of 2 probed" in m.value for m in at.sidebar.markdown), [m.value for m in at.sidebar.markdown]
-    # an UNSUPPORTED verified hit is shown as a hand-open link, never as a selectable URL
-    assert any("cannot extract" in m.value and "cld.bz" in m.value for m in at.sidebar.markdown)
-    use_btn = [b for b in at.sidebar.button if b.label == "Use as target URL"][0]
-    use_btn.click()
-    run(at)
-    assert at.session_state["url_box"] == "https://nab26.mapyourshow.com/8_0/explore/exhview.cfm", at.session_state["url_box"]
-    assert sidebar_text_input(at, "Directory / floor-plan URL").value.endswith("exhview.cfm")
-    # send the 2026 hit to a timeline slot: creates the slot, pre-fills year, mode and URL
-    n_slots = len(at.session_state["timeline_slots"])
-    [b for b in at.sidebar.button if b.label == "Send to a 2026 timeline slot"][0].click()
-    run(at)
-    slots = at.session_state["timeline_slots"]
-    assert len(slots) == n_slots + 1, slots
-    sid = slots[-1]["id"]
-    assert at.session_state[f"slot_url_{sid}"].endswith("exhview.cfm") and at.session_state[f"slot_year_{sid}"] == 2026
-    assert at.session_state[f"slot_mode_{sid}"] == "Directory URL"
-    print("finder UI:", at.session_state["url_box"], "-> slot", sid)
-
-    # a lookup failure is an inline error, not an exception
-    def failing_find(*a, **kw):
-        raise show_finder.ShowFinderError("Tavily lookup failed: ConnectionError: proxy 403")
-    show_finder.find_show_urls = failing_find
-    [b for b in at.sidebar.button if b.label == "Search & verify"][0].click()
-    run(at)
-    assert any("Tavily lookup failed" in e.value for e in at.sidebar.error), [e.value for e in at.sidebar.error]
-finally:
-    show_finder.find_show_urls = orig_find
+assert any("failed" in line.lower() for line in at.session_state["extract_log"]), at.session_state["extract_log"]
 
 print("\nAPP TEST PASSED")

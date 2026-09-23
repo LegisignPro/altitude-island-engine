@@ -1,4 +1,7 @@
-"""Offline checks: scraper against the mock MapYourShow server, delta engine, freight, pitch, Apollo mock."""
+"""Offline logic checks: MapYourShow HTTP client against a local test server, delta engine, freight, pitch, Apollo (no key).
+
+The company names below are unit-test inputs for the classification logic only; they never reach the app.
+Extractor correctness is tested against REAL captured payloads in tests/test_v3_extractors.py."""
 import io
 import os
 import subprocess
@@ -58,14 +61,6 @@ def test_scraper():
     assert scraper.infer_show_name("https://nab27.mapyourshow.com/") == "NAB Show 2027"
     print("scraper OK:", log)
     return pd.DataFrame(rows, columns=scraper.EXHIBITOR_COLUMNS)
-
-
-def test_fallback():
-    rows, meta = scraper.load_fallback_dataset()
-    assert len(rows) == 20 and meta["source"] == "demo"
-    assert all(set(scraper.EXHIBITOR_COLUMNS) <= set(r) for r in rows)
-    assert meta["show_base"] == "NAB Show" and meta["show_year"] == 2027
-    print("fallback OK")
 
 
 def test_show_year():
@@ -206,14 +201,12 @@ def test_freight():
     print("freight OK")
 
 
-def test_apollo_mock_and_pitch(delta_df: pd.DataFrame):
-    org = apollo.get_organization("acmebroadcast.com", "", mock=True)
-    assert org["found"] and org["source"] == "MOCK" and org["employees"]
-    assert apollo.get_organization("acmebroadcast.com", "", mock=True) == org  # deterministic
-    assert apollo.get_organization("", "", mock=True)["error"] == "no domain"
-    assert apollo.get_organization("x.com", "", mock=False)["error"] == "no API key"
-    ppl = apollo.search_people("acmebroadcast.com", "", mock=True)
-    assert all(p["source"] == "MOCK" for p in ppl)
+def test_apollo_and_pitch(delta_df: pd.DataFrame):
+    # v3: no mock mode. No key -> an explicit error, never placeholder data.
+    assert apollo.get_organization("x.com", "")["error"] == "no API key"
+    assert not apollo.get_organization("x.com", "").get("found")
+    assert apollo.search_people("x.com", "") == []
+    assert not hasattr(apollo, "_mock_organization") and not hasattr(apollo, "_mock_people")
     assert apollo._months_in_role({"employment_history": [{"current": True, "start_date": "2026-07-01"}]}) == 2
     assert apollo.domain_from_website("https://www.acme.com/x") == "acme.com"
     assert apollo.domain_from_website("betamedia.io") == "betamedia.io"
@@ -238,7 +231,7 @@ def test_apollo_mock_and_pitch(delta_df: pd.DataFrame):
     assert list(exp.columns) == pg.EXPORT_COLUMNS and len(exp) == len(out)
     assert set(["email", "first_name", "company_name", "booth_sqft", "trigger_badge", "pitch_angle",
                 "custom_intro_line"]) <= set(exp.columns)
-    print("apollo mock + pitch OK")
+    print("apollo (no mock) + pitch OK")
     print(out[["exhibitor_name", "sqft", "yoy_status", "trigger_badge"]].to_string())
 
 
@@ -253,6 +246,10 @@ def test_platform_detection():
     # White-labelled A2Z on a show's own domain (real example from Woz: a2z.aafp.org) -- caught by
     # the /Public/EventMap.aspx path signature since the host alone gives no hint.
     assert platforms.platform_for("https://a2z.aafp.org/future2026/Public/eventmap.aspx?shMode=E") == "a2z"
+    # White-label MapYourShow (IMTS) by its /8_0/ path; the live probe confirms it at extraction time.
+    assert platforms.platform_for("https://directory.imts.com/8_0/explore/exhibitor-gallery.cfm?featured=false") == "mapyourshow"
+    assert platforms.platform_for("https://www.expocad.com/host/fx/informa/26dcw/exfx.html") == "expocad"
+    assert platforms.roadmap_name("https://moneyus2026visitorview.coconnex.com/") is not None
     # A URL with neither a known host nor a known path stays unrecognised, not a guess.
     assert platforms.platform_for("https://example.com/some/random/page") is None
     print("platform detection OK")
@@ -378,13 +375,12 @@ if __name__ == "__main__":
     proc = start_server()
     try:
         current = test_scraper()
-        test_fallback()
         test_show_year()
         delta_df = test_delta(current)
         test_classify_trajectory()
         test_build_trajectories()
         test_freight()
-        test_apollo_mock_and_pitch(delta_df)
+        test_apollo_and_pitch(delta_df)
         test_platform_detection()
         test_show_finder()
         print("\nALL MODULE TESTS PASSED")
