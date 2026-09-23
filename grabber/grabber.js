@@ -451,8 +451,17 @@
     var esc = function (v) { v = v === null || v === undefined ? "" : String(v); return /[",\n\r]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
     return [COLUMNS.join(",")].concat(rows.map(function (r) { return COLUMNS.map(function (c) { return esc(r[c]); }).join(","); })).join("\r\n");
   }
+  function button(label, onclick) {
+    var b = document.createElement("button");
+    b.textContent = label;
+    b.style.cssText = "display:block;margin-top:8px;padding:7px 12px;border-radius:6px;border:0;background:#1f6fb5;" +
+      "color:#fff;cursor:pointer;font:600 13px -apple-system,Segoe UI,Roboto,sans-serif";
+    b.onclick = onclick;
+    panel.appendChild(b);
+    return b;
+  }
   function download(name, text) {
-    var blob = new Blob(["﻿" + text], { type: "text/csv;charset=utf-8" });
+    var blob = new Blob(["\ufeff" + text], { type: "text/csv;charset=utf-8" });
     var a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name;
     document.body.appendChild(a); a.click(); setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
   }
@@ -487,15 +496,20 @@
         // One file only: browsers block a second automatic download from the same click.
         var blob = new Blob([JSON.stringify({ platform: platform, url: location.origin + location.pathname, captured_at: new Date().toISOString(),
           meta: res.meta, quality: q, raw: RAW, csv: toCSV(rows) })], { type: "application/json" });
-        var a2 = document.createElement("a"); a2.href = URL.createObjectURL(blob); a2.download = rawName; document.body.appendChild(a2); a2.click();
+        var saveRaw = function () { var a2 = document.createElement("a"); a2.href = URL.createObjectURL(blob); a2.download = rawName; document.body.appendChild(a2); a2.click(); };
+        saveRaw();
+        button("Save debug file again", saveRaw).id = "__aig_raw_btn";
         log("Debug: raw payload + CSV saved together as " + rawName);
         return;
       }
       if (q.grade === "FAIL") { log("\nNot downloaded: quality FAIL. Nothing here is safe to compare."); return; }
       var slug = (res.meta.show_name || location.host.split(".")[0]).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
       var fname = slug + "_" + (res.meta.show_year || "year-unknown") + "_" + platform + ".csv";
-      download(fname, toCSV(rows));
-      log("\nDownloaded " + fname + " — load it in the Island Engine (Timeline tab).");
+      var csvText = toCSV(rows);
+      download(fname, csvText);
+      button("Download CSV again", function () { download(fname, csvText); }).id = "__aig_csv_btn";
+      log("\nDownloaded " + fname + " — load it in the Island Engine sidebar (Map Grabber CSVs). If your browser " +
+          "blocked the download, use the button below.");
     } catch (e) {
       log("\nStopped: " + (e && e.message ? e.message : e));
     } finally {
