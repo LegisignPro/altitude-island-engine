@@ -19,7 +19,7 @@
 
   var VERSION = "3.0.0";
   var SQM_TO_SQFT = 10.7639;
-  var DETAIL_MIN_SQFT = 200;      // detail pages (website, HQ city/state) only for booths this big
+  var DETAIL_MIN_SQFT = 400;      // detail pages (website, HQ city/state) only for island-size booths
   var DETAIL_WORKERS = 4;          // polite: at most 4 requests in flight
   var RAW = {};                    // canonical raw payload (same shape the Python normalisers read)
   var EXCLUDE_NAME_RE = /\b(pavilion|association|state of|department)\b/i;
@@ -85,9 +85,12 @@
       document.head.appendChild(s);
     });
   }
-  async function pool(items, worker, n) {
-    var out = new Array(items.length), i = 0;
-    async function run() { while (i < items.length) { var k = i++; try { out[k] = await worker(items[k], k); } catch (e) { out[k] = null; } } }
+  async function pool(items, worker, n, label) {
+    var out = new Array(items.length), i = 0, done = 0;
+    var prog = null;
+    if (label && items.length > 20) { prog = document.createElement("div"); prog.style.color = "#94a3b8"; logEl.appendChild(prog); }
+    async function run() { while (i < items.length) { var k = i++; try { out[k] = await worker(items[k], k); } catch (e) { out[k] = null; }
+      done++; if (prog && (done % 10 === 0 || done === items.length)) prog.textContent = "  " + label + ": " + done + " / " + items.length; } }
     var runners = []; for (var j = 0; j < Math.min(n, items.length); j++) runners.push(run());
     await Promise.all(runners);
     return out;
@@ -252,7 +255,7 @@
       var am = h.match(/addressValues\s*:\s*(\{[^}]*\})/);
       RAW.details[r.exhid] = { website: r.website, linkedin: r.company_linkedin, phone: r.phone, address: am ? am[1] : "" };
       if (am) { try { var a = JSON.parse(am[1]); r.city = clean(a.CITY); r.state = clean(a.STATE); r.country = clean(a.COUNTRY); } catch (e) { /* leave blank */ } }
-    }, DETAIL_WORKERS);
+    }, DETAIL_WORKERS, "detail pages");
     var yr = showid.match(/(\d{2,4})$/);
     return { rows: rows, meta: {
       platform: "mapyourshow", show_name: clean(document.title.split("|")[0]).replace(/\s*\b20\d{2}\b\s*$/, ""),
@@ -304,13 +307,16 @@
     var todo = rows.filter(function (r) { return r.sqft >= DETAIL_MIN_SQFT && r.detail_url; });
     log("Reading " + todo.length + " booth pages (" + DETAIL_MIN_SQFT + "+ sq ft)...");
     await pool(todo, async function (r) {
-      var d = new DOMParser().parseFromString(await getText(r.detail_url), "text/html");
-      var t = function (c) { var e = d.getElementsByClassName(c)[0]; return e ? clean(e.textContent).replace(/,$/, "") : ""; };
+      var html = await getText(r.detail_url);
+      var t = function (c) {
+        var m = html.match(new RegExp('class="' + c + '"[^>]*>([\\s\\S]*?)</'));
+        return m ? clean(m[1].replace(/<[^>]+>/g, " ").replace(/&amp;/g, "&")).replace(/,$/, "") : "";
+      };
       r.city = t("BoothContactCity"); r.state = t("BoothContactState"); r.country = t("BoothContactCountry");
       var site = t("BoothContactUrl"); if (site && !/^https?:/i.test(site)) site = "https://" + site;
       r.website = site;
       (RAW.details = RAW.details || {})[r.exhid] = { city: r.city, state: r.state, country: r.country, website: r.website };
-    }, DETAIL_WORKERS);
+    }, DETAIL_WORKERS, "booth pages");
     return { rows: rows, meta: { platform: "a2z", show_name: clean(document.title.replace(/-\s*Event Map.*/i, "").replace(/\b20\d{2}\b/, "")),
       show_year: yearFrom(document.title) || yearFrom(location.pathname), platform_count: labelCount, booth_records: records.length } };
   }
@@ -477,7 +483,7 @@
       log("Quality: " + q.grade + "\n  " + q.notes.join("\n  "));
       window.__AIG_RESULT = { rows: rows, meta: res.meta, quality: q, raw: RAW };
       if (window.__AIG_DEBUG) {
-        var rawName = (res.meta.show_name || location.host.split(".")[0]).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") + "_" + platform + "_raw.json";
+        var rawName = (res.meta.show_name || location.host.split(".")[0]).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") + "_" + (res.meta.show_year || "year-unknown") + "_" + platform + "_raw.json";
         // One file only: browsers block a second automatic download from the same click.
         var blob = new Blob([JSON.stringify({ platform: platform, url: location.origin + location.pathname, captured_at: new Date().toISOString(),
           meta: res.meta, quality: q, raw: RAW, csv: toCSV(rows) })], { type: "application/json" });
