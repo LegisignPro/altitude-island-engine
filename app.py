@@ -5,26 +5,39 @@ app.py -- Altitude Exhibits Island Lead Engine (Streamlit).
     streamlit run app.py
 
 Modules
-    scraper.py          MapYourShow JSON extraction + demo fallback
+    platforms.py        URL -> platform router (MapYourShow incl. custom domains, A2Z, EXPOCAD, ExpoFP)
+    extractors/         one module per platform: extract() live, normalise() pure (tested on real payloads)
+    quality.py          PASS / WARN / FAIL checks on every extraction and every loaded CSV
+    showfile.py         loads Map Grabber CSVs / app exports; refuses generated data
+    grabber/            the in-browser Map Grabber bookmark (same row logic as extractors/)
+    scraper.py          MapYourShow HTTP client
     delta_engine.py     year-over-year footprint delta ("Newborn Island")
     freight.py          HQ-based freight arbitrage tagging
-    apollo.py           Apollo organisation enrichment + people search (live or mock)
+    apollo.py           Apollo organisation enrichment + people search (live key only, no mock)
     pitch_generator.py  trigger hierarchy, intro lines, Instantly/Smartlead export
     show_finder.py      Tavily search + content verification: show name -> directory URL(s), by year
 
-Every number on screen is either an observed MapYourShow fact, an Apollo
-firmographic, or a value computed from those two. Nothing is modelled.
+Every number on screen is either an observed floor-plan fact, an Apollo
+firmographic, or a value computed from those two. Nothing is modelled and
+there is no demo or mock data anywhere in v3.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime
+from pathlib import Path
+from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 import apollo
+import quality
+import showfile
+from extractors.common import ROW_COLUMNS, ExtractionError
 import delta_engine
 import freight
 import pitch_generator as pg
@@ -47,7 +60,9 @@ TAB_LABELS = [
     "🚚 Vegas Freight & Local Storage Arbitrage",
     "👤 Apollo Contact Enrichment & New Hire Finder",
     "✉️ Pitch Angle Generator & Export",
+    "🧭 Map Grabber & Platform Check",
 ]
+GRADE_PILL = {"PASS": "ax-pass", "WARN": "ax-warn", "FAIL": "ax-fail", "FAIL-OVERRIDDEN": "ax-fail"}
 
 CSS = """
 <style>
@@ -59,8 +74,9 @@ CSS = """
 .ax-pill { display: inline-block; padding: .2rem .65rem; border-radius: 999px; font-size: .74rem; font-weight: 700;
            letter-spacing: .05em; text-transform: uppercase; margin: 0 .35rem .35rem 0; border: 1px solid transparent; }
 .ax-live   { background: rgba(34,197,94,.16);  color: #16a34a; border-color: rgba(34,197,94,.5); }
-.ax-demo   { background: rgba(245,158,11,.18); color: #d97706; border-color: rgba(245,158,11,.55); }
-.ax-mock   { background: rgba(139,92,246,.16); color: #7c3aed; border-color: rgba(139,92,246,.5); }
+.ax-pass   { background: rgba(34,197,94,.16);  color: #16a34a; border-color: rgba(34,197,94,.5); }
+.ax-warn   { background: rgba(245,158,11,.18); color: #d97706; border-color: rgba(245,158,11,.55); }
+.ax-fail   { background: rgba(239,68,68,.16);  color: #dc2626; border-color: rgba(239,68,68,.55); }
 .ax-info   { background: rgba(59,130,246,.14); color: #2563eb; border-color: rgba(59,130,246,.45); }
 .ax-badge  { display: inline-block; padding: .18rem .6rem; border-radius: 6px; font-size: .74rem; font-weight: 700;
              color: #fff; letter-spacing: .04em; margin-right: .4rem; }
@@ -104,17 +120,13 @@ def current_show_label() -> str:
     year = st.session_state.get("show_year")
     if year in (None, ""):
         year = meta.get("show_year")
-    label = f"{base} {int(year)}" if year not in (None, "") else base
-    if meta.get("source") == "demo":
-        label += " (DEMO DATA)"
-    return label
+    return f"{base} {int(year)}" if year not in (None, "") else base
 
 
 def show_file_stub() -> str:
     """
     Filename-safe '{show_base}_{show_year}' (year omitted when unknown), built from the
-    same editable fields as current_show_label() but WITHOUT the "(DEMO DATA)" suffix --
-    that belongs on screen, not baked into a file a person might rename and forward.
+    same editable fields as current_show_label().
     """
     meta = st.session_state.get("meta") or {}
     base = (st.session_state.get("show_base") or "").strip() or (meta.get("show_base") or "Trade Show")
@@ -143,6 +155,9 @@ def init_state() -> None:
     st.session_state.setdefault("finder", None)          # show_finder.find_show_urls() result
     st.session_state.setdefault("finder_error", "")
     st.session_state.setdefault("tavily_key", "")
+    st.session_state.setdefault("quality", None)         # quality.check() of the current show
+    st.session_state.setdefault("raw", None)             # canonical raw payload of the last live extraction
+    st.session_state.setdefault("csv_errors", [])
 
 
 def reset_apollo() -> None:
@@ -189,10 +204,15 @@ def load_timeline_slot(slot_id: int) -> None:
             slot["error"] = "Choose a CSV file first."
             return
         try:
-            prior = delta_engine.load_prior_csv(up)
-            slot["df"] = prior.rename(columns={"prior_name": "exhibitor_name", "prior_sqft": "sqft"}) \
-                               [["exhibitor_name", "sqft"]]
+            df, fmeta = showfile.load(up)
+            q = quality.check(df.to_dict("records"), fmeta, chosen_year=int(year))
+            if q["grade"] == "FAIL" and not st.session_state.get(f"slot_force_{slot_id}"):
+                slot["df"] = None
+                slot["error"] = f"Quality FAIL: {q['notes']}"
+                return
+            slot["df"] = df[["exhibitor_name", "sqft"]]
             slot["label"] = up.name
+            slot["quality"] = q["grade"]
         except ValueError as exc:
             slot["df"] = None
             slot["error"] = str(exc)
@@ -205,10 +225,16 @@ def load_timeline_slot(slot_id: int) -> None:
             url = "https://" + url
         try:
             # facts only: no website fetch, no Apollo -- any supported platform works here
-            rows, meta = platforms.extract_directory(url)
-            slot["df"] = pd.DataFrame(rows, columns=scraper.EXHIBITOR_COLUMNS)[["exhibitor_name", "sqft"]]
+            rows, meta, _raw = platforms.extract(url)
+            q = quality.check(rows, meta, chosen_year=int(year))
+            if q["grade"] == "FAIL" and (q["demo"] or not st.session_state.get(f"slot_force_{slot_id}")):
+                slot["df"] = None
+                slot["error"] = f"Quality FAIL: {q['notes']}"
+                return
+            slot["df"] = pd.DataFrame(rows, columns=ROW_COLUMNS)[["exhibitor_name", "sqft"]]
             slot["label"] = meta.get("show_name") or url
-        except scraper.ScrapeError as exc:
+            slot["quality"] = q["grade"]
+        except (ExtractionError, scraper.ScrapeError) as exc:
             slot["df"] = None
             slot["error"] = f"Extraction failed: {exc}"
         except Exception as exc:  # a bad year/site must not crash the whole app
@@ -337,7 +363,7 @@ def render_finder_hits(hits: list[dict], key: str, action_label: str, on_pick, e
 def render_sidebar() -> dict:
     with st.sidebar:
         st.markdown("### Altitude Exhibits")
-        st.caption("Island Lead Engine: MapYourShow facts + Apollo firmographics. No modelled data.")
+        st.caption("Island Lead Engine v3: floor-plan facts + Apollo firmographics. No modelled, demo or mock data.")
 
         st.markdown("**API configuration**")
         secret_key = ""
@@ -347,14 +373,8 @@ def render_sidebar() -> dict:
             secret_key = ""
         api_key = st.text_input("Apollo API key", value=secret_key, type="password",
                                 help="Master API key from app.apollo.io > Settings > Integrations > API. "
-                                     "Leave blank to run the UI on clearly-labelled mock responses.")
+                                     "Without a key the Apollo tab stays empty (there is no mock mode).")
         api_key = (api_key or "").strip()
-        mock_default = not bool(api_key)
-        use_mock = st.checkbox("Use mock Apollo responses", value=mock_default,
-                               help="Mock data is deterministic placeholder output for demoing the UI. "
-                                    "It is labelled MOCK everywhere it appears and is never real firmographics.")
-        if not api_key and not use_mock:
-            st.warning("No Apollo key: enrichment will return nothing. Add a key or enable mock mode.")
         budget = st.number_input("Max Apollo org lookups per run (1 credit each)", min_value=1, max_value=500,
                                  value=DEFAULT_APOLLO_BUDGET, step=5,
                                  help="Apollo Free = 75 credits/month. People search is free.")
@@ -371,15 +391,20 @@ def render_sidebar() -> dict:
 
         st.divider()
         st.markdown("**Target show**")
+        st.file_uploader("Map Grabber CSVs (one or more years of the same show)", type=["csv"],
+                         accept_multiple_files=True, key="show_csvs",
+                         help="Download each year's floor plan with the Map Grabber bookmark (last tab), then drop "
+                              "the files here. The newest year becomes the current show; older years fill the "
+                              "Show Timeline automatically. Files with generated/demo rows are refused.")
+        load_csvs = st.button("Load CSVs", width="stretch", disabled=not st.session_state.get("show_csvs"))
+        for err in st.session_state.get("csv_errors") or []:
+            st.error(err)
+        st.caption("...or extract live from a URL:")
         url = st.text_input("Directory / floor-plan URL (MapYourShow, A2Z, EXPOCAD, ExpoFP)", key="url_box",
                             placeholder="https://ces2026.mapyourshow.com/8_0/explore/exhibitor-gallery.cfm",
-                            help="Any page on a mapyourshow.com, a2zinc.net/mya2zevents.com, expocad(web).com, "
-                                 "or expofp.com host. MapYourShow is read via its JSON endpoints; the other "
-                                 "three are read by intercepting the JSON their floor plan loads in the "
-                                 "background, which needs a browser and can take longer.")
-        allow_demo = st.checkbox("Load demo dataset if the URL fails", value=True,
-                                 help="20 fictional exhibitors so the UI can be demonstrated offline. "
-                                      "Clearly banded as DEMO DATA whenever shown.")
+                            help="MapYourShow (also white-label hosts like directory.imts.com), A2Z EventMap.aspx, "
+                                 "ExpoFP <show>.expofp.com, EXPOCAD exfx.html. Some shows block cloud servers; "
+                                 "the Map Grabber bookmark in your own browser always works.")
         render_show_finder()
 
         # Editable show name/year (Task 1: the "+1 year" fix). Re-seeded from the freshly
@@ -424,9 +449,9 @@ def render_sidebar() -> dict:
         st.divider()
         run = st.button("Run Extraction", type="primary", width="stretch")
 
-    return {"api_key": api_key, "use_mock": use_mock, "budget": int(budget), "url": (url or "").strip(),
-            "allow_demo": allow_demo, "min_sqft": int(min_sqft), "max_sqft": int(max(max_sqft, min_sqft)),
-            "run": run}
+    return {"api_key": api_key, "budget": int(budget), "url": (url or "").strip(),
+            "min_sqft": int(min_sqft), "max_sqft": int(max(max_sqft, min_sqft)),
+            "run": run, "load_csvs": load_csvs}
 
 
 def render_show_finder() -> None:
@@ -484,63 +509,101 @@ def render_show_finder() -> None:
 # Extraction
 # =============================================================================
 
-def run_extraction(url: str, allow_demo: bool, min_sqft: int, max_sqft: int) -> None:
+def set_current_show(df: pd.DataFrame, meta: dict, raw: dict | None, log: list[str]) -> dict:
+    """Make `df` the current show everywhere. Returns its quality report."""
+    df = df.copy()
+    for c in ROW_COLUMNS:
+        if c not in df.columns:
+            df[c] = ""
+    df["sqft"] = pd.to_numeric(df["sqft"], errors="coerce").fillna(0).astype(int)
+    meta.setdefault("extracted_at", datetime.now().strftime("%b %d, %Y %I:%M %p"))
+    meta["extracted_at"] = meta["extracted_at"] or datetime.now().strftime("%b %d, %Y %I:%M %p")
+    meta.setdefault("total", len(df))
+    meta.setdefault("sized", int((df["sqft"] > 0).sum()))
+    q = quality.check(df.to_dict("records"), meta)
+    st.session_state["exhibitors"] = df
+    st.session_state["meta"] = meta
+    st.session_state["quality"] = q
+    st.session_state["raw"] = raw
+    st.session_state["extract_log"] = log
+    st.session_state["show_base"] = meta.get("show_base") or ""
+    st.session_state["show_year"] = meta.get("show_year")
+    st.session_state["use_anyway"] = False
+    reset_apollo()
+    return q
+
+
+def run_extraction(url: str) -> None:
     log: list[str] = []
-    rows, meta = None, None
-    with st.status("Extracting directory...", expanded=True) as status:
+    with st.status("Extracting floor plan...", expanded=True) as status:
         def _log(msg: str) -> None:
             log.append(msg)
             st.write(msg)
 
-        if url:
-            if not url.startswith("http"):
-                url = "https://" + url
-            platform = platforms.platform_for(url)
-            _log(f"Detected platform: {platform or 'unrecognised'} for `{url}`")
-            try:
-                rows, meta = platforms.extract_directory(url, log=_log)
-                if meta.get("platform") == "mapyourshow":
-                    # The other platforms already carry a website straight from their own JSON;
-                    # this extra per-exhibitor detail-page fetch is MapYourShow-specific.
-                    targets = [r for r in rows if min_sqft <= r["sqft"] <= max_sqft]
-                    _log(f"Fetching websites from detail pages for {len(targets)} in-range exhibitors")
-                    scraper.enrich_websites(targets, url, log=_log)
-            except scraper.ScrapeError as exc:
-                _log(f"Live extraction failed: {exc}")
-                rows = None
-            except Exception as exc:  # the demo must not crash on an unexpected shape
-                _log(f"Unexpected error during extraction: {exc.__class__.__name__}: {exc}")
-                rows = None
-        else:
+        if not url:
             _log("No URL entered.")
-
-        if rows is None:
-            if allow_demo:
-                _log("Loading the DEMO fallback dataset (20 fictional exhibitors).")
-                rows, meta = scraper.load_fallback_dataset()
-            else:
-                status.update(label="Extraction failed", state="error", expanded=True)
-                st.session_state["extract_log"] = log
-                return
-
-        df = pd.DataFrame(rows, columns=scraper.EXHIBITOR_COLUMNS)
-        df["sqft"] = pd.to_numeric(df["sqft"], errors="coerce").fillna(0).astype(int)
-        meta["extracted_at"] = datetime.now().strftime("%b %d, %Y %I:%M %p")
-        st.session_state["exhibitors"] = df
-        st.session_state["meta"] = meta
-        st.session_state["extract_log"] = log
-        # Pre-fill the editable show name/year from this extraction (Task 1: year
-        # is a fact from THIS scrape, never carried over from a prior run or guessed).
-        st.session_state["show_base"] = meta.get("show_base") or ""
-        st.session_state["show_year"] = meta.get("show_year")
-        reset_apollo()
-        platform_txt = f" (live {meta.get('platform', 'mapyourshow')})" if meta["source"] == "live" else ""
-        status.update(label=f"Extracted {len(df)} exhibitors from {meta['show_name']}{platform_txt}",
-                      state="complete", expanded=False)
-    # Rerun once so the sidebar's Show name/year inputs (rendered before this
-    # function runs) immediately reflect the freshly extracted values instead
-    # of lagging one interaction behind. Tab selection survives via key="main_tabs".
+            status.update(label="No URL", state="error")
+            st.session_state["extract_log"] = log
+            return
+        if not url.startswith("http"):
+            url = "https://" + url
+        try:
+            rows, meta, raw = platforms.extract(url, log=_log)
+        except (ExtractionError, scraper.ScrapeError) as exc:
+            _log(f"Extraction failed: {exc}")
+            status.update(label="Extraction failed (nothing loaded)", state="error", expanded=True)
+            st.session_state["extract_log"] = log
+            return
+        except Exception as exc:  # never crash the page on an unexpected shape
+            _log(f"Unexpected error during extraction: {exc.__class__.__name__}: {exc}")
+            status.update(label="Extraction failed (nothing loaded)", state="error", expanded=True)
+            st.session_state["extract_log"] = log
+            return
+        q = set_current_show(pd.DataFrame(rows, columns=ROW_COLUMNS), meta, raw, log)
+        status.update(label=f"Extracted {len(rows)} companies from {meta.get('show_name')} "
+                            f"({meta.get('platform')}) -- quality {q['grade']}",
+                      state="complete" if q["grade"] != "FAIL" else "error", expanded=False)
     st.rerun()
+
+
+def load_show_csvs(files) -> None:
+    """Newest year -> current show; every older year -> a timeline slot (replacing a slot of the same year)."""
+    errors, loaded = [], []
+    for f in files or []:
+        try:
+            df, meta = showfile.load(f)
+        except showfile.ShowFileError as exc:
+            errors.append(str(exc))
+            continue
+        if not meta.get("show_year"):
+            errors.append(f"{meta['filename']}: no show year in the file or its name. Rename it with the year "
+                          f"(e.g. kbis_2025.csv) and load again.")
+            continue
+        loaded.append((df, meta))
+    st.session_state["csv_errors"] = errors
+    if not loaded:
+        return
+    loaded.sort(key=lambda t: t[1]["show_year"])
+    cur_df, cur_meta = loaded[-1]
+    set_current_show(cur_df, cur_meta, None, [f"Loaded {cur_meta['filename']} ({len(cur_df)} companies)"])
+    slots = [s_ for s_ in st.session_state["timeline_slots"]
+             if s_.get("year") not in {m["show_year"] for _, m in loaded}]
+    for df, meta in loaded[:-1]:
+        if meta["show_year"] == cur_meta["show_year"]:
+            errors.append(f"{meta['filename']}: same year as {cur_meta['filename']}; skipped.")
+            continue
+        q = quality.check(df.to_dict("records"), meta)
+        if q["grade"] == "FAIL":
+            errors.append(f"{meta['filename']}: quality FAIL ({q['notes']}); not added to the timeline.")
+            continue
+        st.session_state["_slot_seq"] += 1
+        sid = st.session_state["_slot_seq"]
+        slots.append({"id": sid, "year": meta["show_year"], "df": df[["exhibitor_name", "sqft"]],
+                      "label": meta["filename"], "error": "", "quality": q["grade"]})
+        st.session_state[f"slot_year_{sid}"] = meta["show_year"]
+        st.session_state[f"slot_mode_{sid}"] = SLOT_MODE_CSV
+    st.session_state["timeline_slots"] = sorted(slots, key=lambda s_: s_.get("year") or 0)[-MAX_TIMELINE_SLOTS:]
+    st.session_state["csv_errors"] = errors
 
 
 # =============================================================================
@@ -576,7 +639,7 @@ def build_targets(params: dict) -> pd.DataFrame:
     people: dict = st.session_state["people"]
     targets["domain"] = targets["website"].map(apollo.domain_from_website)
 
-    org_cols = {"employees": [], "hq_city": [], "hq_state": [], "hq_country": [], "industry": [],
+    org_cols = {"employees": [], "hq_city": [], "hq_state": [], "hq_country": [], "hq_source": [], "industry": [],
                 "revenue_usd": [], "apollo_source": [], "apollo_status": []}
     contact_cols = {"first_name": [], "last_name": [], "contact_name": [], "contact_title": [], "email": [],
                     "linkedin": [], "months_in_role": [], "new_hire": [], "contacts_found": []}
@@ -589,9 +652,13 @@ def build_targets(params: dict) -> pd.DataFrame:
         else:
             status = "enriched" if org.get("found") else f"no data ({org.get('error') or 'no match'})"
         org_cols["employees"].append(org.get("employees"))
-        org_cols["hq_city"].append(org.get("hq_city", ""))
-        org_cols["hq_state"].append(org.get("hq_state", ""))
-        org_cols["hq_country"].append(org.get("hq_country", ""))
+        # HQ: Apollo when it has one, else what the exhibitor listed in the show directory
+        # (MapYourShow / A2Z / EXPOCAD detail data). Never guessed.
+        use_dir = not (org.get("hq_state") or org.get("hq_country"))
+        org_cols["hq_city"].append(org.get("hq_city", "") if not use_dir else (row.get("city") or ""))
+        org_cols["hq_state"].append(org.get("hq_state", "") if not use_dir else (row.get("state") or ""))
+        org_cols["hq_country"].append(org.get("hq_country", "") if not use_dir else (row.get("country") or ""))
+        org_cols["hq_source"].append("Apollo" if not use_dir else ("directory" if (row.get("state") or row.get("country")) else ""))
         org_cols["industry"].append(org.get("industry", ""))
         org_cols["revenue_usd"].append(org.get("revenue_usd"))
         org_cols["apollo_source"].append(org.get("source", "") if org.get("found") else "")
@@ -616,6 +683,7 @@ def build_targets(params: dict) -> pd.DataFrame:
 
     targets["employees"] = pd.to_numeric(targets["employees"], errors="coerce")
     targets["oversized"] = targets["employees"].fillna(0) > apollo.MAX_EMPLOYEES
+    targets["hq_state"] = [apollo.normalise_state(s, c) if s else s for s, c in zip(targets["hq_state"], targets["hq_country"])]
     targets["region"] = [freight.region_of(s, c) for s, c in zip(targets["hq_state"], targets["hq_country"])]
     targets["freight_tag"] = [freight.freight_tag(s, c) for s, c in zip(targets["hq_state"], targets["hq_country"])]
 
@@ -651,26 +719,48 @@ def contact_level(targets: pd.DataFrame, show_name: str) -> pd.DataFrame:
 # =============================================================================
 
 def source_banner(meta: dict) -> None:
-    if meta["source"] == "demo":
-        st.warning("DEMO DATA: the directory could not be read (or no URL was entered), so the 20 fictional "
-                   "exhibitors below are placeholders for the UI walk-through. Nothing here is a real company.")
     platform_label = {"mapyourshow": "MapYourShow", "a2z": "A2Z", "expocad": "EXPOCAD",
-                      "expofp": "ExpoFP"}.get(meta.get("platform"), "MapYourShow")
-    pills = (f"<span class='ax-pill ax-live'>Live {platform_label}</span>" if meta["source"] == "live"
-             else "<span class='ax-pill ax-demo'>Demo data</span>")
+                      "expofp": "ExpoFP", "csv": "CSV"}.get(meta.get("platform"), meta.get("platform") or "?")
+    q = st.session_state.get("quality") or {"grade": "PASS", "findings": [], "notes": ""}
+    how = "Live" if meta.get("source") == "live" else "File"
+    pills = f"<span class='ax-pill ax-live'>{how} &middot; {platform_label}</span>"
     pills += f"<span class='ax-pill ax-info'>{current_show_label()}</span>"
+    pills += f"<span class='ax-pill {GRADE_PILL[q['grade']]}'>Quality {q['grade']}</span>"
     if meta.get("halls"):
         pills += f"<span class='ax-pill ax-info'>{meta['halls']} halls</span>"
     st.markdown(pills, unsafe_allow_html=True)
-    note = f"{meta['total']} exhibitors, {meta['sized']} with floor-plan geometry, extracted {meta['extracted_at']}"
-    if meta.get("hall_errors"):
-        note += f", {meta['hall_errors']} hall(s) failed to load"
-    if meta.get("low_confidence"):
-        # Browser-platform rows whose footprint came through a fuzzy field-name match: real numbers
-        # read from the payload, but from a column the normaliser had to guess the meaning of.
-        note += (f", {meta['low_confidence']} sized via fuzzy field matches (size_source ends in -fuzzy; "
-                 f"spot-check against the live floor plan)")
-    st.markdown(f"<div class='ax-muted'>{note}</div>", unsafe_allow_html=True)
+    note = f"{meta.get('total', 0)} companies, {meta.get('sized', 0)} with a booth size"
+    if meta.get("filename"):
+        note += f", from {meta['filename']}"
+    if meta.get("extracted_at"):
+        note += f", extracted {meta['extracted_at']}"
+    st.markdown(f"<div class='ax-muted'>{md(note)}</div>", unsafe_allow_html=True)
+    render_quality(q)
+
+
+def render_quality(q: dict, key: str = "main") -> None:
+    icon = {"PASS": "✅", "WARN": "⚠️", "FAIL": "⛔"}
+    with st.expander(f"Extraction quality: {q['grade']}", expanded=q["grade"] == "FAIL"):
+        st.dataframe(pd.DataFrame([{"": icon[f["level"]], "Check": f["check"], "Result": f["note"]}
+                                   for f in q.get("findings", [])]),
+                     hide_index=True, width="stretch", key=f"quality_{key}")
+        if q["grade"] == "FAIL":
+            if q.get("demo"):
+                st.error("Generated/demo rows found. This data can't be exported or compared, with no override.")
+            elif key == "main":
+                st.warning("Exports are blocked on FAIL. Tick below only if you've checked the floor plan yourself; "
+                           "every exported row is then stamped FAIL-OVERRIDDEN.")
+                st.checkbox("Use anyway", key="use_anyway")
+
+
+def export_gate() -> tuple[bool, str, str]:
+    """(allowed, quality stamp, notes) for any CSV export of the current show."""
+    q = st.session_state.get("quality") or {"grade": "PASS", "notes": "", "demo": False}
+    if q["grade"] == "FAIL":
+        if q.get("demo") or not st.session_state.get("use_anyway"):
+            return False, "FAIL", q["notes"]
+        return True, "FAIL-OVERRIDDEN", q["notes"]
+    return True, q["grade"], q["notes"]
 
 
 def metric_row(all_df: pd.DataFrame, targets: pd.DataFrame) -> None:
@@ -726,7 +816,14 @@ BASE_COLUMN_CONFIG = {
     "website": st.column_config.LinkColumn("Website", display_text=r"https?://(?:www\.)?([^/]+)", width="medium"),
     "is_sponsor": st.column_config.CheckboxColumn("Sponsor", width="small"),
     "has_video_listing": st.column_config.CheckboxColumn("Video", width="small"),
-    "detail_url": st.column_config.LinkColumn("MYS listing", display_text="open", width="small"),
+    "detail_url": st.column_config.LinkColumn("Listing", display_text="open", width="small"),
+    "shared_booth": st.column_config.CheckboxColumn("Shared", width="small",
+                                                    help="On a shared/pavilion booth: sq ft is this company's share."),
+    "booth_sqft": st.column_config.NumberColumn("Whole booth", format="%d", width="small"),
+    "city": st.column_config.TextColumn("City", width="small"),
+    "state": st.column_config.TextColumn("State", width="small"),
+    "platform": st.column_config.TextColumn("Platform", width="small"),
+    "raw_size": st.column_config.TextColumn("Size as listed", width="small"),
     "employees": st.column_config.NumberColumn("Employees", format="%d", width="small"),
     "hq_state": st.column_config.TextColumn("HQ state", width="small"),
     "hq_country": st.column_config.TextColumn("HQ country", width="small"),
@@ -739,8 +836,9 @@ BASE_COLUMN_CONFIG = {
     "trigger_badge": st.column_config.TextColumn("Trigger", width="medium"),
     "apollo_source": st.column_config.TextColumn("Source", width="small"),
     "size_source": st.column_config.TextColumn("Size source", width="small",
-                                               help="floorplan / <platform>-json = read cleanly; -fuzzy = read through a "
-                                                    "fuzzy field-name match; unknown = no footprint in the data (0 sq ft)."),
+                                               help="Where the size came from: floorplan (MapYourShow geometry), a2z-map, "
+                                                    "expocad-fx, expofp-svg (booth shape on the map); unknown = the "
+                                                    "platform publishes no size for this company (0 sq ft)."),
 }
 
 
@@ -760,10 +858,10 @@ def tab_scanner(params: dict, all_df: pd.DataFrame, targets: pd.DataFrame, meta:
     source_banner(meta)
     metric_row(all_df, targets)
     st.markdown(f"#### Target islands ({params['min_sqft']:,} to {params['max_sqft']:,} sq ft)")
-    st.caption("Every column is an observed MapYourShow fact. Rows dropped for >1,000 employees (Apollo) are "
-               "listed separately below.")
+    st.caption("Every column is an observed floor-plan fact. Shared/pavilion booths count only this company's "
+               "share of the stand. Rows dropped for >1,000 employees (Apollo) are listed separately below.")
     live = targets[~targets["oversized"]]
-    cols = ["exhibitor_name", "booth_number", "width", "length", "sqft", "hall", "website",
+    cols = ["exhibitor_name", "booth_number", "raw_size", "sqft", "shared_booth", "hall", "city", "state", "website",
             "is_sponsor", "has_video_listing", "detail_url"]
     if live.empty:
         st.info("No exhibitors in the current sq-ft range. Widen the filters in the sidebar.")
@@ -775,13 +873,20 @@ def tab_scanner(params: dict, all_df: pd.DataFrame, targets: pd.DataFrame, meta:
                        key="grid_oversized")
 
     with st.expander(f"Full directory ({len(all_df):,} exhibitors, all sizes)"):
-        show_table(all_df, cols + ["size_source"], int(all_df["sqft"].max() or 1), key="grid_all", height=420)
+        show_table(all_df, cols + ["booth_sqft", "size_source"], int(all_df["sqft"].max() or 1), key="grid_all", height=420)
         with_size = int((all_df["sqft"] > 0).sum())
-        st.caption(f"{with_size:,} of {len(all_df):,} exhibitors have floor-plan geometry. "
-                   f"Exhibitors without geometry show 0 sq ft and never enter the target list.")
-    st.download_button("Download full extraction CSV (use as next year's prior-year file)",
-                       data=all_df.to_csv(index=False).encode("utf-8"),
+        st.caption(f"{with_size:,} of {len(all_df):,} exhibitors have a booth size. "
+                   f"Exhibitors without one show 0 sq ft and never enter the target list.")
+    ok, stamp, notes = export_gate()
+    out = all_df.copy()
+    out["show_name"], out["show_year"] = (st.session_state.get("show_base") or meta.get("show_base") or ""), \
+        (st.session_state.get("show_year") or meta.get("show_year") or "")
+    out["quality"], out["quality_notes"] = stamp, notes
+    st.download_button("Download full extraction CSV (keep it: it's next year's comparison file)",
+                       data=out.to_csv(index=False).encode("utf-8"), disabled=not ok,
                        file_name=f"{show_file_stub()}_exhibitors.csv", mime="text/csv")
+    if not ok:
+        st.caption("Download blocked: extraction quality FAIL (see the quality panel above).")
 
 
 TRAJ_STYLES = {
@@ -793,6 +898,7 @@ TRAJ_STYLES = {
     delta_engine.TRAJ_UPGRADE: "background-color: rgba(34,197,94,.18)",
     delta_engine.TRAJ_DOWNSIZE: "background-color: rgba(100,116,139,.18)",
     delta_engine.TRAJ_NEW: "background-color: rgba(59,130,246,.2)",
+    delta_engine.TRAJ_DROPPED: "background-color: rgba(100,116,139,.35); font-weight: 600",
 }
 
 
@@ -819,8 +925,11 @@ def render_timeline_slot(slot: dict) -> None:
         lc1.button("Load", key=f"slot_load_{sid}", type="primary", on_click=load_timeline_slot, args=(sid,))
         if slot.get("error"):
             lc2.error(slot["error"])
+            if slot["error"].startswith("Quality FAIL") and "demo" not in slot["error"]:
+                lc2.checkbox("Use anyway (I've checked this floor plan)", key=f"slot_force_{sid}")
         elif slot.get("df") is not None:
-            lc2.success(f"{slot.get('label') or 'Loaded'}: {len(slot['df'])} companies, year {slot['year']}")
+            lc2.success(f"{slot.get('label') or 'Loaded'}: {len(slot['df'])} companies, year {slot['year']}"
+                        + (f", quality {slot['quality']}" if slot.get("quality") else ""))
         else:
             lc2.caption("Not loaded yet.")
 
@@ -856,7 +965,9 @@ def render_slot_finder(slot: dict) -> None:
 def tab_timeline(params: dict, targets: pd.DataFrame) -> None:
     st.markdown("#### Multi-year show timeline")
     st.caption(md(
-        "Add prior years as a CSV (this app's own export, or any file with a name and sq-ft column) or a "
+        "Fastest: drop several years of Map Grabber CSVs in the sidebar and they land here automatically. "
+        "Or add prior years one by one as a CSV (Map Grabber file, this app's export, or any file with a name and "
+        "sq-ft column) or a "
         "directory URL for that year's show (any supported platform; with a Tavily key the engine can search "
         "for and verify prior-year URLs for you) -- up to 6 years total. With three or more years on "
         "file the engine sees the SHAPE of a company's booth history, not just one delta: a booth that grew "
@@ -879,17 +990,19 @@ def tab_timeline(params: dict, targets: pd.DataFrame) -> None:
     traj = delta_engine.build_trajectories(all_slots)
     cur = traj[traj["is_current_year"]]
     s = delta_engine.trajectory_summary(traj)
-    m1, m2, m3, m4, m5 = st.columns(5)
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Newborn islands", s.get("newborn", 0))
     m2.metric("Peak retreats", s.get("peak_retreat", 0))
     m3.metric("Steady growth", s.get("steady_growth", 0))
     m4.metric("Shrinking", s.get("shrinking", 0))
     m5.metric("New to show", s.get("new", 0))
+    m6.metric("Dropped out", s.get("dropped_out", 0), help="On the floor last edition, not this one.")
 
     years = sorted(int(y["year"]) for y in all_slots)
     year_cols = [f"sqft_{y}" for y in years]
     cols = ["exhibitor_name"] + year_cols + ["peak_sqft", "peak_year", "current_sqft", "delta_sqft", "trajectory"]
     target_names = set(targets["exhibitor_name"]) if not targets.empty else set()
+    render_dropped_out(traj, years, params)
     view = cur[cur["exhibitor_name"].isin(target_names)].copy() if target_names else cur.iloc[0:0].copy()
     if view.empty:
         st.info("No target islands (within the sidebar's sq-ft filter) have timeline data yet.")
@@ -928,16 +1041,41 @@ def tab_timeline(params: dict, targets: pd.DataFrame) -> None:
                 height=min(60 + 35 * max(len(view), 1), 560))
 
 
+def render_dropped_out(traj: pd.DataFrame, years: list[int], params: dict) -> None:
+    gone = traj[(traj["trajectory"] == delta_engine.TRAJ_DROPPED)].copy()
+    if gone.empty:
+        return
+    prev = years[-2]
+    gone["last_sqft"] = pd.to_numeric(gone[f"sqft_{prev}"], errors="coerce").fillna(0)
+    big = gone[gone["last_sqft"] >= params["min_sqft"]].sort_values("last_sqft", ascending=False)
+    with st.expander(f"Dropped out: {len(gone)} companies exhibited in {prev} but not this year "
+                     f"({len(big)} had {params['min_sqft']:,}+ sq ft)"):
+        st.caption("Former islands that skipped this edition: they may be re-thinking their show plan or their "
+                   "exhibit partner. Check whether they are booked at a competing show.")
+        st.dataframe(big[["exhibitor_name", "last_sqft", "peak_sqft", "peak_year", "first_year"]],
+                     column_config={"exhibitor_name": "Exhibitor",
+                                    "last_sqft": st.column_config.NumberColumn(f"{prev} sq ft", format="%d"),
+                                    "peak_sqft": st.column_config.NumberColumn("Peak sq ft", format="%d"),
+                                    "peak_year": st.column_config.NumberColumn("Peak year", format="%d"),
+                                    "first_year": st.column_config.NumberColumn("First seen", format="%d")},
+                     hide_index=True, width="stretch", key="grid_dropped")
+        ok, stamp, _ = export_gate()
+        st.download_button("Download dropped-out list", data=big.assign(quality=stamp).to_csv(index=False).encode("utf-8"),
+                           file_name=f"{show_file_stub()}_dropped_out.csv", mime="text/csv", disabled=not ok)
+
+
 def tab_freight(params: dict, targets: pd.DataFrame) -> None:
     st.markdown("#### Home-field freight arbitrage")
-    st.caption("HQ state comes from Apollo organisation enrichment (Tab 4). Exhibitors headquartered outside "
+    st.caption("HQ comes from Apollo (Tab 4) or, when Apollo has none, from the exhibitor's own show-directory "
+               "listing (MapYourShow / A2Z / EXPOCAD). Exhibitors headquartered outside "
                "Nevada and the West Coast pay cross-country freight, round-trip drayage and out-of-town I&D "
                "for every Las Vegas show. Nevada HQs get the local storage / asset-takeover angle instead.")
     live = targets[~targets["oversized"]]
-    if not st.session_state["orgs"]:
-        st.info("Run Apollo enrichment in Tab 4 first. HQ location is never guessed.")
-        return
     known = live[live["region"] != "Unknown"]
+    if known.empty:
+        st.info("No HQ locations yet: the directory didn't list them and Apollo hasn't run (Tab 4). "
+                "HQ location is never guessed.")
+        return
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("HQ known", f"{len(known)} / {len(live)}")
     m2.metric("High freight savings", int(live["freight_tag"].map(freight.is_high_freight).sum()))
@@ -947,7 +1085,7 @@ def tab_freight(params: dict, targets: pd.DataFrame) -> None:
     regions = sorted(live["region"].unique())
     pick = st.multiselect("Regions", regions, default=[r for r in regions if r != "Unknown"] or regions)
     view = live[live["region"].isin(pick)].sort_values(["priority", "sqft"], ascending=[True, False])
-    cols = ["exhibitor_name", "sqft", "hq_city", "hq_state", "hq_country", "region", "freight_tag", "apollo_source", "website"]
+    cols = ["exhibitor_name", "sqft", "hq_city", "hq_state", "hq_country", "hq_source", "region", "freight_tag", "website"]
     tag_styles = {
         freight.TAG_HIGH: "background-color: #3b82f6; color: white; font-weight: 700",
         freight.TAG_HIGH_INTL: "background-color: #2563eb; color: white; font-weight: 700",
@@ -963,23 +1101,21 @@ def run_apollo(params: dict, targets: pd.DataFrame) -> None:
     todo = live[(live["domain"] != "") & ~live["domain"].isin(st.session_state["orgs"].keys())]
     todo = todo.sort_values(["priority", "sqft"], ascending=[True, False])
     budget = params["budget"]
-    mock = params["use_mock"]
     log: list[str] = []
     done = 0
     for _, row in todo.iterrows():
-        if not mock and st.session_state["credits_used"] >= budget:
+        if st.session_state["credits_used"] >= budget:
             log.append(f"Budget of {budget} org lookups reached; remaining companies left unenriched.")
             break
         domain = row["domain"]
-        org = apollo.get_organization(domain, params["api_key"], mock=mock)
+        org = apollo.get_organization(domain, params["api_key"])
         st.session_state["orgs"][domain] = org
-        if not mock:
-            st.session_state["credits_used"] += 1
+        st.session_state["credits_used"] += 1
         if org.get("found") and org.get("employees") and org["employees"] > apollo.MAX_EMPLOYEES:
             st.session_state["people"][domain] = []
             log.append(f"{row['exhibitor_name']}: {org['employees']:,} employees, dropped")
         else:
-            ppl = apollo.search_people(domain, params["api_key"], mock=mock)
+            ppl = apollo.search_people(domain, params["api_key"])
             st.session_state["people"][domain] = ppl
             nh = sum(1 for p in ppl if p["new_hire"])
             log.append(f"{row['exhibitor_name']}: {org.get('employees') or '?'} employees, "
@@ -987,8 +1123,8 @@ def run_apollo(params: dict, targets: pd.DataFrame) -> None:
                        + (f", {nh} NEW HIRE" if nh else "")
                        + (f" [{org['error']}]" if org.get("error") else ""))
         done += 1
-    st.session_state["apollo_log"] = [f"Apollo pass complete: {done} companies ({'MOCK' if mock else 'live'})"] + log
-    st.toast(f"Apollo pass complete: {done} companies ({'MOCK' if mock else 'live'})")
+    st.session_state["apollo_log"] = [f"Apollo pass complete: {done} companies"] + log
+    st.toast(f"Apollo pass complete: {done} companies")
 
 
 def tab_apollo(params: dict, targets: pd.DataFrame) -> None:
@@ -1005,15 +1141,15 @@ def tab_apollo(params: dict, targets: pd.DataFrame) -> None:
     c1.metric("Targets with a website", f"{with_domain} / {len(live)}")
     c2.metric("Enriched", len(st.session_state["orgs"]))
     c3.metric("Credits used this session", st.session_state["credits_used"])
-    c4.metric("Mode", "MOCK" if params["use_mock"] else "Live Apollo")
-    if params["use_mock"]:
-        st.markdown("<span class='ax-pill ax-mock'>Mock responses</span> <span class='ax-muted'>placeholder "
-                    "firmographics for the UI walk-through, labelled MOCK in every table and the export</span>",
-                    unsafe_allow_html=True)
+    c4.metric("Key", "set" if params["api_key"] else "missing")
+    if not params["api_key"]:
+        st.info("Add your Apollo API key in the sidebar (or APOLLO_API_KEY in Streamlit secrets) to enrich. "
+                "There is no mock mode: without a key this tab stays empty.")
 
     b1, b2, _ = st.columns([1.6, 1.2, 3])
-    label = f"Run Apollo enrichment ({min(pending, params['budget']) if not params['use_mock'] else pending} companies)"
-    b1.button(label, type="primary", disabled=pending == 0, width="stretch", on_click=on_run_apollo)
+    label = f"Run Apollo enrichment ({min(pending, params['budget'])} companies)"
+    b1.button(label, type="primary", disabled=pending == 0 or not params["api_key"], width="stretch",
+              on_click=on_run_apollo)
     b2.button("Clear Apollo results", width="stretch", disabled=not st.session_state["orgs"], on_click=reset_apollo)
     if with_domain < len(live):
         st.caption(f"{len(live) - with_domain} targets have no website in the directory and are skipped: "
@@ -1116,32 +1252,141 @@ def tab_pitch(params: dict, targets: pd.DataFrame, meta: dict) -> None:
 
     st.markdown("##### Export")
     export_df = pg.build_export(contact_level(view, current_show_label()), current_show_label())
+    ok, stamp, notes = export_gate()
+    export_df["quality"], export_df["quality_notes"] = stamp, notes
     n_with_email = int((export_df["email"] != "").sum()) if not export_df.empty else 0
     st.caption(f"{len(export_df)} rows ({n_with_email} with an email). Columns: {', '.join(pg.EXPORT_COLUMNS[:11])}. "
                "Import into Instantly or Smartlead and map custom_intro_line to a custom variable.")
     st.download_button("Download campaign CSV (Instantly / Smartlead)",
                        data=export_df.to_csv(index=False).encode("utf-8"),
-                       file_name=f"{show_file_stub()}_campaign.csv", mime="text/csv", type="primary")
+                       file_name=f"{show_file_stub()}_campaign.csv", mime="text/csv", type="primary", disabled=not ok)
+    if not ok:
+        st.caption("Export blocked: extraction quality FAIL (see the quality panel on the first tab).")
 
 
 # =============================================================================
 # Main
 # =============================================================================
 
+GRABBER_PATH = Path(__file__).parent / "grabber" / "grabber.min.js"
+
+
+def bookmarklet() -> str:
+    try:
+        return "javascript:" + quote(GRABBER_PATH.read_text(encoding="utf-8"), safe="")
+    except OSError:
+        return ""
+
+
+def render_grabber_install() -> None:
+    st.markdown("#### Map Grabber bookmark")
+    st.markdown(md(
+        "Open any floor plan in your own browser (MapYourShow, A2Z/Personify, EXPOCAD FX, ExpoFP), click the "
+        "bookmark, and it downloads that show's exhibitor list as a CSV: company, booth, exact size, shared-booth "
+        "flag, and (for booths 400+ sq ft) website and HQ city/state from the listing. It reads the same data the "
+        "page itself loads, so it works on shows that block cloud servers. Nothing is sent anywhere."
+    ))
+    bm = bookmarklet()
+    if not bm:
+        st.error("grabber/grabber.min.js is missing from this deployment.")
+        return
+    embed = st.iframe if hasattr(st, "iframe") else (lambda html, height: components.html(html, height=height))
+    embed(
+        f"""<div style="font:14px -apple-system,Segoe UI,Roboto,sans-serif;color:#94a3b8">
+        <a href="{bm.replace('"', '&quot;')}" onclick="return false"
+           style="display:inline-block;padding:10px 16px;border-radius:8px;background:#1f6fb5;color:#fff;
+                  font-weight:700;text-decoration:none;cursor:grab">&#x1F9ED; Altitude Map Grabber</a>
+        <span style="margin-left:12px">&larr; drag this button onto your bookmarks bar</span></div>""",
+        height=60)
+    st.markdown(md(
+        "**Use it**\n"
+        "1. Open the show's floor plan or exhibitor list (e.g. `kbis.a2zinc.net/.../EventMap.aspx`, "
+        "`imexamerica26.expofp.com`, an EXPOCAD `exfx.html` map, or a MapYourShow gallery).\n"
+        "2. Wait for the map to finish loading, then click the bookmark. A panel shows progress, counts and a "
+        "quality grade, then the CSV downloads (FAIL grades don't download).\n"
+        "3. Do the same for last year's (and older) editions of the show.\n"
+        "4. Drop all the CSVs into **Map Grabber CSVs** in the sidebar and click **Load CSVs**."
+    ))
+    with st.expander("Can't drag? Create the bookmark by hand"):
+        st.caption("Make a new bookmark named 'Altitude Map Grabber' and paste this whole line as its URL.")
+        st.code(bm, language=None, wrap_lines=True)
+
+
+def render_platform_check() -> None:
+    st.markdown("#### Platform Check")
+    st.caption("Debug a new show: detects the platform, extracts it, and shows the count at each stage, sample rows "
+               "next to their raw source records, and the quality report. Or check a CSV from the Map Grabber.")
+    c1, c2 = st.columns([3, 1])
+    url = c1.text_input("Floor-plan URL", key="pc_url", placeholder="https://kbis.a2zinc.net/kbis2026/Public/EventMap.aspx?shMode=E")
+    go = c2.button("Check URL", key="pc_go", width="stretch")
+    up = st.file_uploader("...or a CSV to grade", type=["csv"], key="pc_csv")
+    if go and url.strip():
+        u = url.strip() if url.strip().startswith("http") else "https://" + url.strip()
+        st.write(f"Detected platform: **{platforms.platform_for(u, probe=True) or platforms.roadmap_name(u) or 'not recognised'}**")
+        log: list[str] = []
+        try:
+            with st.spinner("Extracting..."):
+                rows, meta, raw = platforms.extract(u, log=log.append)
+        except Exception as exc:  # show every failure plainly -- this tab is for debugging
+            st.error(f"{exc.__class__.__name__}: {exc}")
+            if log:
+                st.code("\n".join(log))
+            return
+        stages = pd.DataFrame([
+            {"Stage": "Records fetched from the platform", "Count": meta.get("fetched", "")},
+            {"Stage": "Records with a company name", "Count": meta.get("named", "")},
+            {"Stage": "Companies after grouping + name filter", "Count": len(rows)},
+            {"Stage": "Companies with a booth size", "Count": sum(1 for r in rows if r["sqft"] > 0)},
+            {"Stage": "Companies at 400+ sq ft (own share)", "Count": sum(1 for r in rows if r["sqft"] >= 400)},
+            {"Stage": "Companies on shared booths", "Count": sum(1 for r in rows if r["shared_booth"])},
+            {"Stage": "Platform's own exhibitor count", "Count": meta.get("platform_count", "")},
+        ])
+        st.dataframe(stages, hide_index=True, width="stretch", key="pc_stages")
+        st.write(f"Show: **{meta.get('show_base') or '?'}**, year stated by the source: "
+                 f"**{meta.get('show_year') or 'none'}** ({meta.get('source_year_text') or 'no year text'})")
+        st.markdown("**Sample normalised rows**")
+        st.dataframe(pd.DataFrame(rows[:5], columns=ROW_COLUMNS), hide_index=True, width="stretch", key="pc_rows")
+        st.markdown("**Raw source records (first 5)**")
+        sample = (raw.get("records") or raw.get("booths") or (raw.get("data") or {}).get("booths")
+                  or raw.get("gallery") or [])[:5]
+        st.code(json.dumps(sample, indent=1, default=str)[:6000], language="json")
+        render_quality(quality.check(rows, meta), key="pc")
+        with st.expander("Extraction log"):
+            st.code("\n".join(log) or "(empty)")
+    elif up is not None:
+        try:
+            df, fmeta = showfile.load(up)
+        except showfile.ShowFileError as exc:
+            st.error(str(exc))
+            return
+        st.write(f"{len(df)} companies, show **{fmeta.get('show_base') or '?'} {fmeta.get('show_year') or ''}**, "
+                 f"platform {fmeta.get('platform')}")
+        render_quality(quality.check(df.to_dict("records"), fmeta), key="pc_csv")
+
+
+def tab_grabber() -> None:
+    render_grabber_install()
+    st.divider()
+    render_platform_check()
+
+
 def render_empty_state() -> None:
     with st.container(border=True):
         st.markdown("**How this works**")
         st.markdown(md(
-            "1. Paste a MapYourShow directory URL in the sidebar (any page on the show's `mapyourshow.com` host) "
-            "and click **Run Extraction**. The app reads the show's JSON endpoints: halls, the full exhibitor "
-            "gallery and the floor-plan booth geometry, then joins them for exact booth footprints.\n"
+            "1. Get the data: click the **Map Grabber** bookmark on a show's floor plan (below) for this year "
+            "and past years, then load the CSVs in the sidebar. Or paste a floor-plan URL and click "
+            "**Run Extraction** (MapYourShow, A2Z, EXPOCAD, ExpoFP).\n"
             "2. The sq-ft filter keeps island exhibitors (default 400 to 3,000 sq ft). Pavilions, associations "
-            "and government stands are removed.\n"
-            "3. Tab 2: add one or more prior years (CSV or URL) to flag companies that just jumped from an "
-            "inline to an island, or that grew to a peak and pulled back -- likely shopping for a new partner.\n"
-            "4. Tab 4: Apollo adds employee count, HQ state and buyer contacts (new hires flagged).\n"
-            "5. Tab 3 and Tab 5: freight arbitrage tags, one pitch angle per company, CSV for Instantly / Smartlead."
+            "and government stands are removed; companies on shared booths count only their share.\n"
+            "3. Show Timeline: companies that jumped from inline to island (NEWBORN ISLAND), peaked and pulled "
+            "back (PEAK RETREAT), grew steadily, or dropped out.\n"
+            "4. Apollo adds employee count, HQ and buyer contacts (new hires flagged).\n"
+            "5. Freight tags and one pitch angle per company, exported for Instantly / Smartlead.\n\n"
+            "Every extraction gets a PASS / WARN / FAIL quality grade; FAIL blocks exports. There is no demo or "
+            "mock data anywhere in this app."
         ))
+    tab_grabber()
 
 
 def main() -> None:
@@ -1150,14 +1395,17 @@ def main() -> None:
     st.markdown(CSS, unsafe_allow_html=True)
     st.markdown(
         "<div class='ax-header'><h1>Altitude Exhibits &middot; Island Lead Engine</h1>"
-        "<p>Low-volume, high-intent island exhibitors from MapYourShow facts and Apollo firmographics. "
-        "No modelled revenue, no guessed websites, no synthetic scores.</p></div>",
+        "<p>v3 &middot; Island exhibitors from MapYourShow, A2Z, EXPOCAD and ExpoFP floor plans plus Apollo "
+        "firmographics. No modelled revenue, no guessed websites, no demo data.</p></div>",
         unsafe_allow_html=True,
     )
     params = render_sidebar()
 
+    if params["load_csvs"]:
+        load_show_csvs(st.session_state.get("show_csvs"))
+        st.rerun()
     if params["run"]:
-        run_extraction(params["url"], params["allow_demo"], params["min_sqft"], params["max_sqft"])
+        run_extraction(params["url"])
 
     if st.session_state["exhibitors"] is None:
         render_empty_state()
@@ -1184,6 +1432,8 @@ def main() -> None:
         tab_apollo(params, targets)
     with tabs[4]:
         tab_pitch(params, targets, meta)
+    with tabs[5]:
+        tab_grabber()
 
 
 if __name__ == "__main__":

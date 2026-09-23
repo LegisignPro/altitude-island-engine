@@ -80,6 +80,7 @@ class ScrapeError(Exception):
 # ---------------------------------------------------------------------------
 
 def is_mapyourshow(url: str) -> bool:
+    """Host check only. White-label MapYourShow hosts are detected by platforms.platform_for(probe=True)."""
     return "mapyourshow.com" in urlparse(url).netloc.lower()
 
 
@@ -464,52 +465,3 @@ def enrich_websites(rows: list[dict], url: str, log=None) -> list[dict]:
             row["has_video_listing"] = True
     log(f"Websites found on detail pages: {found}/{len(todo)}")
     return rows
-
-
-# ---------------------------------------------------------------------------
-# Fallback dataset (DEMO ONLY)
-# ---------------------------------------------------------------------------
-# Twenty fictional mid-to-large exhibitors in exactly the shape a live pull
-# produces, so every tab can be demonstrated when a directory is unreachable.
-# Company names and websites are invented. Every row is tagged size_source =
-# "demo" and the UI shows a warning banner whenever this data is on screen.
-
-FALLBACK_SHOW = "NAB Show 2027 (DEMO DATA)"
-FALLBACK_EXHIBITORS = [
-    # name, booth, width, length, hall, website, sponsor, video
-    ("Lumen Audio Labs", "C5831", 20, 20, "Central Hall", "https://www.lumenaudiolabs.com", False, True),
-    ("Vantage Robotics Systems", "C8437", 20, 30, "Central Hall", "https://www.vantagerobotics.io", True, True),
-    ("Kestrel Aerial Cinema", "N1210", 30, 30, "North Hall", "https://www.kestrelaerial.com", False, False),
-    ("Northbridge Signal Systems", "W2118", 10, 10, "West Hall", "https://www.northbridgesignal.com", False, False),
-    ("Helios Studio Lighting", "C9033", 20, 40, "Central Hall", "https://www.heliosstudiolighting.com", False, True),
-    ("Orbit Wireless Video", "C6502", 20, 20, "Central Hall", "https://www.orbitwirelessvideo.com", False, False),
-    ("Clearwave Networking", "W1419", 30, 40, "West Hall", "https://www.clearwavenet.com", True, True),
-    ("Summit Streaming Platforms", "W4701", 20, 30, "West Hall", "https://www.summitstreaming.com", False, True),
-    ("Aurora Display Technologies", "C7114", 50, 50, "Central Hall", "https://www.auroradisplays.com", True, True),
-    ("Pinnacle Newsroom Software", "W3309", 10, 20, "West Hall", "https://www.pinnaclenewsroom.com", False, False),
-    ("Redrock Podcast Gear", "N5720", 20, 20, "North Hall", "https://www.redrockpodcast.com", False, True),
-    ("Tidewater Satellite Uplink", "N6118", 10, 20, "North Hall", "https://www.tidewateruplink.com", False, False),
-    ("Beacon Intercom Systems", "C10240", 20, 20, "Central Hall", "https://www.beaconintercom.com", False, False),
-    ("Stratos Media AI", "W3316", 40, 40, "West Hall", "https://www.stratosmedia.ai", True, True),
-    ("Copperline Audio", "C5605", 10, 10, "Central Hall", "https://www.copperlineaudio.com", False, False),
-    ("Evergreen Battery Co.", "C9407", 20, 30, "Central Hall", "https://www.evergreenbattery.com", False, False),
-    ("Nimbus Cloud Cameras", "N4022", 20, 20, "North Hall", "https://www.nimbuscams.com", False, True),
-    ("Ironwood Rugged Computing", "W2811", 30, 30, "West Hall", "https://www.ironwoodrugged.com", False, False),
-    ("Skyline Virtual Production", "C8830", 40, 50, "Central Hall", "https://www.skylinevp.com", True, True),
-    ("Meridian Captioning", "W5107", 10, 30, "West Hall", "https://www.meridiancaptioning.com", False, False),
-]
-
-
-def load_fallback_dataset() -> tuple[list[dict], dict]:
-    rows = []
-    for i, (name, booth, w, l, hall, site, sponsor, video) in enumerate(FALLBACK_EXHIBITORS, start=1):
-        rows.append({
-            "exhibitor_name": name, "booth_number": booth, "width": w, "length": l, "sqft": w * l,
-            "hall": hall, "website": site, "is_sponsor": sponsor, "has_video_listing": video,
-            "exhid": f"demo{i}", "detail_url": "", "size_source": "demo",
-        })
-    rows.sort(key=lambda r: (-r["sqft"], r["exhibitor_name"].lower()))
-    meta = {"show_name": FALLBACK_SHOW, "show_base": "NAB Show", "show_year": 2027,
-            "source": "demo", "platform": "mapyourshow", "url": "", "showid": "DEMO",
-            "halls": 3, "hall_errors": 0, "sized": len(rows), "total": len(rows)}
-    return rows, meta

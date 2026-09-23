@@ -92,6 +92,11 @@ def load_prior_csv(file) -> pd.DataFrame:
             raise ValueError("No sq-ft column and no width/length pair found in the prior-year CSV.")
         sqft = pd.to_numeric(df[w_col], errors="coerce") * pd.to_numeric(df[l_col], errors="coerce")
 
+    import quality  # local import: quality imports extractors, which must not import this module
+    fake = quality.demo_rows(df.rename(columns={name_col: "exhibitor_name"}).to_dict("records"))
+    if fake:
+        raise ValueError(f"Refused: this file contains {len(fake)} generated/demo rows (e.g. {', '.join(fake[:3])}). "
+                         "Only real extracted data can be compared.")
     out = pd.DataFrame({"prior_name": df[name_col].astype(str).str.strip(), "prior_sqft": sqft})
     out = out[out["prior_name"] != ""]
     out["name_key"] = out["prior_name"].map(name_key)
@@ -173,6 +178,7 @@ TRAJ_DOWNSIZE = STATUS_DOWNSIZE            # exactly 2 pts, shrank
 TRAJ_STAGNANT = STATUS_STAGNANT            # exactly 2 pts, unchanged
 TRAJ_NEW = STATUS_NEW                      # only ever seen in the current year
 TRAJ_NONE = STATUS_NONE                    # timeline has only one slot -- nothing to compare at all
+TRAJ_DROPPED = "DROPPED OUT"               # exhibited in the most recent prior year, absent this year
 
 PEAK_RETREAT_MIN_PCT = 0.50    # current must be within 50-90% of the historical peak
 PEAK_RETREAT_MAX_PCT = 0.90
@@ -298,6 +304,10 @@ def build_trajectories(slots: list[dict]) -> pd.DataFrame:
         is_current = bool(points) and points[-1][0] == current_year
         rec["is_current_year"] = is_current
         rec["trajectory"] = classify_trajectory(points, len(slots))
+        if not is_current and len(years) >= 2 and points and points[-1][0] == years[-2]:
+            # was on the floor last edition, gone this one: a former exhibitor that may be
+            # re-deciding where (and with whom) to show -- listed on the Timeline tab
+            rec["trajectory"] = TRAJ_DROPPED
         if not is_current or len(slots) <= 1:
             rec["yoy_status"] = STATUS_NONE
         elif len(points) >= 2:
@@ -326,4 +336,5 @@ def trajectory_summary(df: pd.DataFrame) -> dict:
         "downsize": int(counts.get(TRAJ_DOWNSIZE, 0)),
         "stagnant": int(counts.get(TRAJ_STAGNANT, 0)),
         "new": int(counts.get(TRAJ_NEW, 0)),
+        "dropped_out": int((df["trajectory"] == TRAJ_DROPPED).sum()),
     }

@@ -24,16 +24,12 @@ Key creation:          https://app.apollo.io/#/settings/integrations/api
                        (tick "Set as master API key" -- search + enrichment
                        endpoints require it).
 
-MOCK MODE: when no key is set, `mock=True` returns deterministic, clearly
-labelled placeholder records (source = "MOCK") so the UI can be demonstrated.
-Mock records are never presented as real firmographics -- every table and
-export carries the source column.
+No key, no data: there is no mock mode (removed in v3). Without a key the
+Apollo tab simply stays empty.
 """
 
 from __future__ import annotations
 
-import hashlib
-import random
 import re
 from datetime import date
 from urllib.parse import urlparse
@@ -106,19 +102,17 @@ def _months_since(iso_date: str | None) -> int | None:
 # Organisation enrichment (1 credit)
 # ---------------------------------------------------------------------------
 
-def get_organization(domain: str, api_key: str, mock: bool = False) -> dict:
+def get_organization(domain: str, api_key: str) -> dict:
     """
     Firmographics for one domain. Returns a dict with keys:
         found, source, employees, hq_city, hq_state, hq_country, industry,
         revenue_usd, linkedin, error
-    Never raises. `source` is "Apollo" or "MOCK".
+    Never raises. `source` is "Apollo".
     """
     empty = {"found": False, "source": "Apollo", "employees": None, "hq_city": "", "hq_state": "",
              "hq_country": "", "industry": "", "revenue_usd": None, "linkedin": "", "error": ""}
     if not domain:
         return {**empty, "error": "no domain"}
-    if mock:
-        return _mock_organization(domain)
     if not api_key:
         return {**empty, "error": "no API key"}
     try:
@@ -169,7 +163,7 @@ def _org_fields(org: dict) -> dict:
 # People search (0 credits)
 # ---------------------------------------------------------------------------
 
-def search_people(domain: str, api_key: str, titles: list[str] | None = None, mock: bool = False,
+def search_people(domain: str, api_key: str, titles: list[str] | None = None,
                   per_page: int = 5) -> list[dict]:
     """
     People at `domain` with a matching title. Each record:
@@ -180,8 +174,6 @@ def search_people(domain: str, api_key: str, titles: list[str] | None = None, mo
     titles = titles or TARGET_TITLES
     if not domain:
         return []
-    if mock:
-        return _mock_people(domain)
     if not api_key:
         return []
     try:
@@ -249,55 +241,3 @@ def reveal_email(person_id: str, api_key: str) -> str:
     except (requests.exceptions.RequestException, ValueError):
         return ""
 
-
-# ---------------------------------------------------------------------------
-# Mock responses (MVP demo without a key). Deterministic per domain.
-# ---------------------------------------------------------------------------
-
-_MOCK_STATES = ["NY", "NJ", "MA", "PA", "IL", "OH", "MI", "MN", "TX", "GA", "FL", "NV", "CA", "WA",
-                "CO", "AZ", "NC", "VA", "", ""]
-_MOCK_COUNTRIES_INTL = ["United Kingdom", "Germany", "Canada", "Japan", "Netherlands"]
-_MOCK_INDUSTRIES = ["Broadcast Media", "Computer Hardware", "Telecommunications", "Consumer Electronics",
-                    "Media Production", "Wireless", "Information Technology & Services"]
-_MOCK_FIRST = ["Dana", "Marcus", "Priya", "Tom", "Elena", "Victor", "Sofia", "Owen", "Nadia", "Luis",
-               "Grace", "Isaac", "Hannah", "Ravi", "Claire", "Jamal", "Mei", "Ben", "Aisha", "Noah"]
-_MOCK_LAST = ["Whitfield", "Bell", "Raman", "Okafor", "Marsh", "Huang", "Delgado", "Kaplan", "Petrova",
-              "Herrera", "Lindqvist", "Moreau", "Osei", "Menon", "Dubois", "Carter", "Tanaka", "Sorensen"]
-
-
-def _rng(domain: str, salt: str = "") -> random.Random:
-    seed = int(hashlib.md5(f"{domain}|{salt}".encode()).hexdigest(), 16) % (2 ** 32)
-    return random.Random(seed)
-
-
-def _mock_organization(domain: str) -> dict:
-    rng = _rng(domain, "org")
-    state = rng.choice(_MOCK_STATES)
-    if state:
-        country, city = "United States", ""
-    else:
-        country, city = rng.choice(_MOCK_COUNTRIES_INTL), ""
-    employees = rng.choice([35, 60, 90, 140, 220, 310, 450, 620, 880, 1400, 2600])
-    return {
-        "found": True, "source": "MOCK", "employees": employees, "hq_city": city, "hq_state": state,
-        "hq_country": country, "industry": rng.choice(_MOCK_INDUSTRIES),
-        "revenue_usd": float(employees * rng.choice([180_000, 240_000, 310_000])),
-        "linkedin": f"https://www.linkedin.com/company/{domain.split('.')[0]}", "error": "",
-    }
-
-
-def _mock_people(domain: str) -> list[dict]:
-    rng = _rng(domain, "people")
-    n = rng.choice([0, 1, 1, 2, 2, 3])
-    out = []
-    for i in range(n):
-        first, last = rng.choice(_MOCK_FIRST), rng.choice(_MOCK_LAST)
-        months = rng.choice([2, 4, 5, 9, 14, 22, 37, 60, 84])
-        out.append({
-            "first_name": first, "last_name": last, "name": f"{first} {last}",
-            "title": rng.choice(TARGET_TITLES),
-            "email": "",  # search never reveals emails, mock mirrors that
-            "linkedin": f"https://www.linkedin.com/in/{first.lower()}-{last.lower()}-mock",
-            "months_in_role": months, "new_hire": months < NEW_HIRE_MONTHS, "source": "MOCK",
-        })
-    return out
