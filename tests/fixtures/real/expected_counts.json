@@ -1,0 +1,35 @@
+{
+ "data-center-world_2026_expocad_raw.json": {
+  "companies": 45,
+  "full_show": {
+   "companies": 480,
+   "islands_400": 66,
+   "platform_count": 480,
+   "shared": 0,
+   "show_year": 2026
+  },
+  "islands_400": 20
+ },
+ "imex-america_2025_expofp_raw.json": {
+  "companies": 235,
+  "full_show": {
+   "companies": 3654,
+   "islands_400": 54,
+   "platform_count": 3674,
+   "shared": 3462,
+   "show_year": 2025
+  },
+  "islands_400": 20
+ },
+ "imex-america_2026_expofp_raw.json": {
+  "companies": 145,
+  "full_show": {
+   "companies": 3622,
+   "islands_400": 58,
+   "platform_count": 3641,
+   "shared": 3438,
+   "show_year": 2026
+  },
+  "islands_400": 20
+ }
+}
