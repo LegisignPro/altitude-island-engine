@@ -42,6 +42,7 @@ import delta_engine
 import freight
 import pitch_generator as pg
 import platforms
+import sales_navigator
 import scraper
 import show_finder
 
@@ -55,12 +56,12 @@ DEFAULT_MAX_SQFT = 3000
 DEFAULT_APOLLO_BUDGET = 25
 
 TAB_LABELS = [
-    "🎯 Lead Scanner & Directory Extractor",
-    "📈 Show Timeline & Newborn Islands",
-    "🚚 Vegas Freight & Local Storage Arbitrage",
-    "👤 Apollo Contact Enrichment & New Hire Finder",
+    "\U0001f3af Lead Scanner & Directory Extractor",
+    "\U0001f4c8 Show Timeline & Newborn Islands",
+    "\U0001f69a Vegas Freight & Local Storage Arbitrage",
+    "\U0001f464 Apollo Contact Enrichment & New Hire Finder",
     "✉️ Pitch Angle Generator & Export",
-    "🧭 Map Grabber & Platform Check",
+    "\U0001f9ed Map Grabber & Platform Check",
 ]
 GRADE_PILL = {"PASS": "ax-pass", "WARN": "ax-warn", "FAIL": "ax-fail", "FAIL-OVERRIDDEN": "ax-fail"}
 
@@ -878,6 +879,18 @@ def tab_scanner(params: dict, all_df: pd.DataFrame, targets: pd.DataFrame, meta:
         st.caption(f"{with_size:,} of {len(all_df):,} exhibitors have a booth size. "
                    f"Exhibitors without one show 0 sq ft and never enter the target list.")
     ok, stamp, notes = export_gate()
+
+    st.markdown("##### Sales Navigator account list")
+    st.caption("The target islands above, in LinkedIn's own account-upload format (Lists → Accounts → "
+               "Import accounts in Sales Navigator). One file per show, named for this conference, so nothing "
+               "needs reformatting before it goes up.")
+    sn_df = sales_navigator.build(live)
+    st.download_button(f"Download Sales Navigator account list ({len(sn_df):,} accounts)",
+                       data=sales_navigator.to_csv_bytes(live), disabled=not ok or sn_df.empty,
+                       file_name=f"{show_file_stub()}_sales_navigator.csv", mime="text/csv")
+    if sn_df.empty and ok:
+        st.caption("No target islands in range to export.")
+
     out = all_df.copy()
     out["show_name"], out["show_year"] = (st.session_state.get("show_base") or meta.get("show_base") or ""), \
         (st.session_state.get("show_year") or meta.get("show_year") or "")

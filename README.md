@@ -42,6 +42,17 @@ booth_sqft, raw_size, city, state, country, company_linkedin, phone, description
 - Website and HQ city/state come from the exhibitor's own listing (MapYourShow, A2Z, EXPOCAD)
   for island-size booths; freight tags use them when Apollo hasn't run.
 
+## Sales Navigator account lists
+
+The **Target islands** section of the Lead Scanner tab has a "Download Sales Navigator account list"
+button: the current show's target islands (name, website, HQ city/country, industry, LinkedIn company
+page), in LinkedIn's own account-upload template column order, named for that conference
+(`<show>_<year>_sales_navigator.csv`). No reformatting step — scan a map, and the file is ready for
+Lists → Accounts → Import accounts in Sales Navigator. HQ fields prefer Apollo when it has run, else
+the show directory's own listing, same as the on-screen table; fields the directory never published
+(street, ZIP, stock symbol, numeric LinkedIn company id) are left blank, never guessed. Blocked by the
+same quality gate as the other exports (`sales_navigator.py`).
+
 ## Extraction quality
 
 Every extraction and every loaded CSV is graded PASS / WARN / FAIL (`quality.py`): row count,
@@ -70,6 +81,7 @@ Apollo key: sidebar or `APOLLO_API_KEY` in `.streamlit/secrets.toml`. Tavily key
     showfile.py         CSV loader (grabber files, app exports, any name + sq-ft CSV); refuses demo rows
     delta_engine.py     year-over-year and multi-year trajectories (NEWBORN ISLAND ... DROPPED OUT)
     apollo.py, freight.py, pitch_generator.py, show_finder.py   as in v2 (Apollo mock removed)
+    sales_navigator.py  target islands -> LinkedIn Sales Navigator account-upload CSV
     browser_scraper.py  ensure_browser() for EXPOCAD on the server
     scraper.py          MapYourShow HTTP client
 
