@@ -96,12 +96,20 @@ assert not at.session_state["orgs"]
 dl = [b for b in at.get("download_button") if "campaign" in str(b.proto.label).lower()]
 assert dl and not dl[0].proto.disabled
 
+# 5b. Sales Navigator account-list export: present, enabled on PASS/WARN, one row per target island
+sn = [b for b in at.get("download_button") if "sales navigator" in str(b.proto.label).lower()]
+assert sn, "Sales Navigator download button missing"
+assert not sn[0].proto.disabled
+assert f"({expected:,} accounts)" in sn[0].proto.label or expected == 0, sn[0].proto.label
+
 # 6. A FAIL grade blocks exports (demo leakage can't be overridden)
 q = quality.check(cur_df.to_dict("records"), cur_meta)
 at.session_state["quality"] = {**q, "grade": "FAIL", "demo": True, "notes": "test"}
 run(at)
 dl = [b for b in at.get("download_button") if "campaign" in str(b.proto.label).lower()]
 assert dl and dl[0].proto.disabled, "FAIL must block the campaign export"
+sn = [b for b in at.get("download_button") if "sales navigator" in str(b.proto.label).lower()]
+assert sn and sn[0].proto.disabled, "FAIL must block the Sales Navigator export too"
 assert not by_label(at.checkbox, "Use anyway"), "demo FAIL must not offer an override"
 
 # 7. Bad live URL -> clear error, previous data kept, no fallback

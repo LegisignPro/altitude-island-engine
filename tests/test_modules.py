@@ -18,6 +18,7 @@ import delta_engine  # noqa: E402
 import freight  # noqa: E402
 import pitch_generator as pg  # noqa: E402
 import platforms  # noqa: E402
+import sales_navigator  # noqa: E402
 import scraper  # noqa: E402
 import show_finder  # noqa: E402
 
@@ -376,6 +377,42 @@ def test_show_finder():
     print("show_finder OK")
 
 
+def test_sales_navigator():
+    df = pd.DataFrame([
+        {"exhibitor_name": "Demand Vape", "website": "http://www.demandvape.com", "city": "Buffalo",
+         "state": "NY", "country": "USA", "hq_city": "", "hq_country": "", "categories": "Vape",
+         "industry": "", "company_linkedin": "https://www.linkedin.com/company/demand-vape/"},
+        # Apollo-enriched row: hq_* wins over the directory's own city/country.
+        {"exhibitor_name": "BDD Wholesale", "website": "http://bdd.com", "city": "Stockton", "state": "CA",
+         "country": "USA", "hq_city": "San Jose", "hq_country": "United States", "categories": "",
+         "industry": "Wholesale", "company_linkedin": ""},
+        # No name at all (shouldn't happen, but never upload a blank account).
+        {"exhibitor_name": "", "website": "http://x.com", "city": "", "state": "", "country": "",
+         "hq_city": "", "hq_country": "", "categories": "", "industry": "", "company_linkedin": ""},
+    ])
+    out = sales_navigator.build(df)
+    assert list(out.columns) == sales_navigator.SN_COLUMNS
+    assert len(out) == 2  # blank-name row dropped
+    row = out[out["Account Name (REQUIRED)"] == "Demand Vape"].iloc[0]
+    assert row["Website URL (OPTIONAL)"] == "http://www.demandvape.com"
+    assert row["Country (OPTIONAL)"] == "USA"  # falls back to directory country, no hq_country
+    assert row["City (OPTIONAL)"] == "Buffalo"
+    assert row["Industry (OPTIONAL)"] == "Vape"  # falls back to categories, no Apollo industry
+    assert row["LinkedIn Company URL (OPTIONAL)"] == "https://www.linkedin.com/company/demand-vape/"
+    assert row["Street (OPTIONAL)"] == "" and row["Stock symbol (OPTIONAL)"] == "" \
+        and row["Zip/Postal Code (OPTIONAL)"] == "" and row["LinkedIn Company ID (OPTIONAL)"] == ""
+    row2 = out[out["Account Name (REQUIRED)"] == "BDD Wholesale"].iloc[0]
+    assert row2["City (OPTIONAL)"] == "San Jose"  # Apollo hq_city wins over directory city
+    assert row2["Country (OPTIONAL)"] == "United States"
+    assert row2["Industry (OPTIONAL)"] == "Wholesale"
+    assert sales_navigator.build(pd.DataFrame(columns=df.columns)).empty
+    assert list(sales_navigator.build(pd.DataFrame(columns=df.columns)).columns) == sales_navigator.SN_COLUMNS
+    # missing columns altogether (e.g. a bare exhibitor_name/website frame) never crashes
+    bare = sales_navigator.build(pd.DataFrame([{"exhibitor_name": "Solo Co"}]))
+    assert len(bare) == 1 and bare.iloc[0]["Website URL (OPTIONAL)"] == ""
+    print("sales_navigator OK")
+
+
 if __name__ == "__main__":
     proc = start_server()
     try:
@@ -388,6 +425,7 @@ if __name__ == "__main__":
         test_apollo_and_pitch(delta_df)
         test_platform_detection()
         test_show_finder()
+        test_sales_navigator()
         print("\nALL MODULE TESTS PASSED")
     finally:
         proc.terminate()
