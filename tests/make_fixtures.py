@@ -28,7 +28,9 @@ from extractors import a2z, common, expocad, expofp, mys  # noqa: E402
 
 OUT = os.path.join(ROOT, "tests", "fixtures", "real")
 NORM = {"a2z": a2z.normalise, "expocad": expocad.normalise, "expofp": expofp.normalise, "mapyourshow": mys.normalise}
-N_COMPANIES = 60
+N_COMPANIES = 45
+CSV_COLUMNS = ["exhibitor_name", "booth_number", "sqft", "booth_sqft", "shared_booth", "shared_with", "platform",
+               "show_name", "show_year"]
 
 
 def prep(cap):
@@ -51,7 +53,8 @@ def parity(rows, csv_text):
 def pick_keys(rows, n):
     """A spread: the biggest islands, some mid, some small, some shared."""
     rows = sorted(rows, key=lambda r: -r["sqft"])
-    shared = [r for r in rows if r.get("shared_booth")][:8]
+    # small shared stands only: a 100-company pavilion would drag every member into the fixture
+    shared = [r for r in rows if r.get("shared_booth") and (r.get("shared_with") or 0) <= 4][:6]
     picks = rows[:20] + rows[len(rows) // 3: len(rows) // 3 + 15] + rows[-10:] + shared
     seen, out = set(), []
     for r in picks:
@@ -60,6 +63,17 @@ def pick_keys(rows, n):
             seen.add(k)
             out.append(r["exhibitor_name"])
     return out[:n]
+
+
+def slim(platform, raw):
+    """Drop free-text fields the normalisers don't need for sizes (keeps fixtures small)."""
+    if platform == "expofp":
+        raw = {**raw, "data": {**raw["data"], "exhibitors": [{**e, "description": ""} for e in raw["data"]["exhibitors"]]}}
+    if platform == "expocad":
+        raw = {**raw, "exhibitors": [{**e, "profile": ""} for e in raw["exhibitors"]]}
+    if platform == "mapyourshow":
+        raw = {**raw, "gallery": [{**h, "fields": {**(h.get("fields") or {}), "exhdesc_t": ""}} for h in raw["gallery"]]}
+    return raw
 
 
 def trim(platform, raw, names):
@@ -118,7 +132,7 @@ def main(paths):
             print(only.head(10).to_string(), "\n", diff.head(10).to_string())
             raise SystemExit(f"PARITY FAILED for {stem}")
         names = pick_keys(rows, N_COMPANIES)
-        small = trim(platform, raw, names)
+        small = slim(platform, trim(platform, raw, names))
         srows, _ = NORM[platform](small)
         keys = {common.name_key(n) for n in names}     # only the selected companies are compared
         with open(os.path.join(OUT, f"{stem}_raw.json"), "w") as fh:
@@ -126,7 +140,7 @@ def main(paths):
                        "raw": small, "trimmed_from": {"companies": len(rows)}}, fh, separators=(",", ":"))
         # write the browser's own rows (original CSV lines) for the kept companies
         full = pd.read_csv(io.StringIO(cap["csv"].lstrip("﻿")), dtype=str, keep_default_na=False)
-        full[full["exhibitor_name"].map(common.name_key).isin(keys)].to_csv(
+        full[full["exhibitor_name"].map(common.name_key).isin(keys)][CSV_COLUMNS].to_csv(
             os.path.join(OUT, f"{stem}.csv"), index=False)
         counts[f"{stem}_raw.json"] = {
             "full_show": {"companies": len(rows), "islands_400": sum(r["sqft"] >= 400 for r in rows),
