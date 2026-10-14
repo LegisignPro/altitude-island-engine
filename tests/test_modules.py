@@ -1,7 +1,7 @@
 """Offline logic checks: MapYourShow HTTP client against a local test server, delta engine, freight, pitch, Apollo (no key).
 
 The company names below are unit-test inputs for the classification logic only; they never reach the app.
-Extractor correctness is tested against REAL captured payloads in tests/test_v3_extractors.py."""
+Extractor correctness is tested against REAL captured payloads in tests/test_v3.py."""
 import io
 import os
 import subprocess
@@ -207,7 +207,12 @@ def test_apollo_and_pitch(delta_df: pd.DataFrame):
     assert not apollo.get_organization("x.com", "").get("found")
     assert apollo.search_people("x.com", "") == []
     assert not hasattr(apollo, "_mock_organization") and not hasattr(apollo, "_mock_people")
-    assert apollo._months_in_role({"employment_history": [{"current": True, "start_date": "2026-07-01"}]}) == 2
+    # relative to today, so the check doesn't go stale as the calendar moves
+    from datetime import date
+    y, m = date.today().year, date.today().month - 2
+    if m <= 0:
+        y, m = y - 1, m + 12
+    assert apollo._months_in_role({"employment_history": [{"current": True, "start_date": f"{y}-{m:02d}-01"}]}) == 2
     assert apollo.domain_from_website("https://www.acme.com/x") == "acme.com"
     assert apollo.domain_from_website("betamedia.io") == "betamedia.io"
 

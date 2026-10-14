@@ -139,7 +139,7 @@ def main(paths):
             json.dump({"platform": platform, "url": cap["url"], "captured_at": cap["captured_at"], "meta": meta,
                        "raw": small, "trimmed_from": {"companies": len(rows)}}, fh, separators=(",", ":"))
         # write the browser's own rows (original CSV lines) for the kept companies
-        full = pd.read_csv(io.StringIO(cap["csv"].lstrip("﻿")), dtype=str, keep_default_na=False)
+        full = pd.read_csv(io.StringIO(cap["csv"].lstrip(chr(0xFEFF))), dtype=str, keep_default_na=False)
         full[full["exhibitor_name"].map(common.name_key).isin(keys)][CSV_COLUMNS].to_csv(
             os.path.join(OUT, f"{stem}.csv"), index=False)
         counts[f"{stem}_raw.json"] = {
